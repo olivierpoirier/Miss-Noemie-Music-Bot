@@ -134,11 +134,14 @@ export const MPV_CONFIG = {
     "--audio-format=float",
     "--audio-channels=stereo",
     "--audio-samplerate=48000",
-    "--audio-resample-filter-size=24",
-    "--audio-resample-cutoff=0",
-    "--audio-resample-linear=yes",
+    "--audio-resample-filter-size=32",
+    "--audio-resample-cutoff=0.97",
+    "--audio-resample-linear=no",
+    "--audio-normalize-downmix=yes",
+    "--ad-lavc-ac3drc=0",
     "--gapless-audio=yes",
     "--audio-pitch-correction=yes",
+    "--volume-max=100",
 
     // Robustesse
     `--audio-buffer=${envOrDefault("MPV_AUDIO_BUFFER_SEC", "2.0")}`,
