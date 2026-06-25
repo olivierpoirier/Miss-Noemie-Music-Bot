@@ -12,8 +12,8 @@ type BusyState =
   | null;
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || "";
-const BUSY_TIMEOUT = 8_000;
-const PENDING_MAX_AGE_MS = 20_000;
+const BUSY_TIMEOUT = 30_000;
+const PENDING_MAX_AGE_MS = 60_000;
 
 function makeClientRequestId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -39,7 +39,7 @@ export default function useLiveQueue() {
 
   const [pendingItems, setPendingItems] = useState<PendingItem[]>([]);
   const [toast, setToast] = useState("");
-  const [systemError, setSystemError] = useState(false);
+  const [systemError, setSystemError] = useState<string | null>(null);
   const [busy, setBusyState] = useState<BusyState>(null);
 
   const socketRef = useRef<Socket | null>(null);
@@ -129,8 +129,8 @@ export default function useLiveQueue() {
       clearBusy();
     });
 
-    s.on("error_system", () => {
-      setSystemError(true);
+    s.on("error_system", (message?: string) => {
+      setSystemError(message || "Virtual audio routing is not available on the server.");
     });
 
     s.on("toast", (msg: string) => {
@@ -202,7 +202,7 @@ export default function useLiveQueue() {
     [setBusy]
   );
 
-  const command = (cmd: Command, arg?: number) =>
+  const command = (cmd: Command, arg?: number | string) =>
     emitSafe("command", { cmd, arg }, cmd);
 
   const clear = () => emitSafe("clear", undefined, "clear");

@@ -1,4 +1,4 @@
-import { Info, Link2, Search, Youtube, Music2, History } from "lucide-react";
+import { Info, Link2, Search, Youtube, Music2, History, MonitorPlay } from "lucide-react";
 
 import type { ThemeName } from "../lib/themes";
 import { cn } from "../lib/cn";
@@ -41,6 +41,17 @@ export default function SupportedLinksHelp({
         <ThemedPanel theme={theme} rainbow={rainbow} soft className="p-3">
           <div className="flex items-center gap-2 mb-2 font-semibold">
             <Music2 className={cn("w-4 h-4", iconClass, rainbow && "rainbow-cycle")} />
+            <span>SoundCloud</span>
+          </div>
+          <div className="opacity-85 space-y-1">
+            <div>â€¢ titre SoundCloud</div>
+            <div>â€¢ set / playlist SoundCloud</div>
+          </div>
+        </ThemedPanel>
+
+        <ThemedPanel theme={theme} rainbow={rainbow} soft className="p-3">
+          <div className="flex items-center gap-2 mb-2 font-semibold">
+            <Music2 className={cn("w-4 h-4", iconClass, rainbow && "rainbow-cycle")} />
             <span>Spotify</span>
           </div>
           <div className="opacity-85 space-y-1">
@@ -50,6 +61,21 @@ export default function SupportedLinksHelp({
             <div className="opacity-70">
               Certaines radios ou playlists dynamiques Spotify peuvent ne pas
               être lisibles.
+            </div>
+          </div>
+        </ThemedPanel>
+
+        <ThemedPanel theme={theme} rainbow={rainbow} soft className="p-3">
+          <div className="flex items-center gap-2 mb-2 font-semibold">
+            <MonitorPlay className={cn("w-4 h-4", iconClass, rainbow && "rainbow-cycle")} />
+            <span>Twitch et liens directs</span>
+          </div>
+          <div className="opacity-85 space-y-1">
+            <div>â€¢ live, VOD et clips Twitch</div>
+            <div>â€¢ fichiers ou flux audio publics : MP3, AAC, M3U8, FLAC, etc.</div>
+            <div className="opacity-70">
+              Les sites protÃ©gÃ©s par une connexion ou un DRM restent limitÃ©s par
+              leurs propres droits d&apos;accÃ¨s.
             </div>
           </div>
         </ThemedPanel>

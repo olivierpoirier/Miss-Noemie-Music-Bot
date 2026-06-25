@@ -7,8 +7,9 @@ import { Server as IOServer } from "socket.io";
 import path from "node:path";
 import play from "play-dl";
 
-import { APP_CONFIG } from "./config";
-import { state, nextId, playing, QueueItem } from "./types";
+import { APP_CONFIG, MPV_CONFIG } from "./config.js";
+import { normalizeAudioProfileName } from "./audioProfiles.js";
+import { state, nextId, playing, QueueItem } from "./types.js";
 import {
   ensurePlayerLoop,
   ensureMpvRunning,
@@ -17,21 +18,29 @@ import {
   seekRelative,
   playPrevious,
   skipGroup,
-} from "./player";
+  warmUpcomingTracks,
+} from "./player.js";
 import {
   mpvPause,
   mpvSetLoopFile,
   mpvSeekAbsolute,
-} from "./mpv";
+  mpvSetAudioProfile,
+} from "./mpv.js";
 import {
   resolveUrlToPlayableItems,
   probeSingle,
   normalizeUrl,
-} from "./ytdlp";
+} from "./ytdlp.js";
+import {
+  isPlaylistUrl,
+  isSpotifyUrl,
+  isYoutubeSearchUrl,
+} from "./platforms/index.js";
 import {
   ensureAudioRoutingReady,
   getRuntimeAudioRouting,
-} from "./utils";
+  isVirtualAudioRoutingReady,
+} from "./utils.js";
 
 const app = express();
 const server = http.createServer(app);
@@ -69,27 +78,8 @@ function computePosition(now: typeof state.now): number {
   return Math.max(0, current);
 }
 
-function isSpotifyUrl(url: string): boolean {
-  return url.includes("spotify.com") || url.includes("open.spotify");
-}
-
-function isYoutubeSearchUrl(url: string): boolean {
-  return (
-    url.includes("youtube.com/results?") ||
-    url.includes("music.youtube.com/search?")
-  );
-}
-
-function isPlaylistUrl(url: string): boolean {
-  return (
-    url.includes("list=") ||
-    url.includes("/playlist") ||
-    url.includes("/sets/")
-  );
-}
-
 function isProbablyUrl(input: string): boolean {
-  return /^https?:\/\//i.test(input);
+  return /^https?:\/\//i.test(input) || input.startsWith("spotify:");
 }
 
 function shuffleArray<T>(items: T[]): T[] {
@@ -196,6 +186,12 @@ function pushQueueItem(
   return newItem;
 }
 
+function warmQueueIfPlaying(): void {
+  if (playing) {
+    warmUpcomingTracks();
+  }
+}
+
 /* --- INITIALISATION --- */
 
 async function setupSpotify() {
@@ -257,6 +253,15 @@ io.on("connection", (socket) => {
     "play",
     async (payload: { url?: string; addedBy?: string; clientRequestId?: string }) => {
       try {
+        if (!isVirtualAudioRoutingReady()) {
+          socket.emit(
+            "toast",
+            "Lecture bloquÃ©e : le routage audio virtuel du serveur n'est pas prÃªt."
+          );
+          if (systemAudioWarning) socket.emit("error_system", systemAudioWarning);
+          return;
+        }
+
         const raw = String(payload?.url || "").trim();
         const addedBy = (payload.addedBy || "anon").slice(0, 32);
         const clientRequestId =
@@ -287,6 +292,7 @@ io.on("connection", (socket) => {
           });
 
           broadcast();
+          warmQueueIfPlaying();
           void ensurePlayerLoop(broadcast);
           return;
         }
@@ -330,6 +336,7 @@ io.on("connection", (socket) => {
 
           socket.emit("toast", `${items.length} titres ajoutés !`);
           broadcast();
+          warmQueueIfPlaying();
           void ensurePlayerLoop(broadcast);
           return;
         }
@@ -343,6 +350,7 @@ io.on("connection", (socket) => {
         });
 
         broadcast();
+        warmQueueIfPlaying();
 
         if (!isYoutubeSearchUrl(normalized)) {
           void enrichQueuedItem(queued.id, normalized);
@@ -433,8 +441,26 @@ io.on("connection", (socket) => {
         break;
       }
 
+      case "audio_profile": {
+        const profile = normalizeAudioProfileName(String(payload.arg || ""));
+        state.control.audioProfile = profile;
+
+        if (h) {
+          await mpvSetAudioProfile(h, profile);
+        }
+
+        socket.emit(
+          "toast",
+          profile === "xbox"
+            ? "Profil audio Xbox activé."
+            : "Profil audio équilibré activé."
+        );
+        break;
+      }
+
       case "random_mode": {
         state.control.randomMode = Boolean(payload.arg);
+        warmQueueIfPlaying();
         break;
       }
 
@@ -443,6 +469,7 @@ io.on("connection", (socket) => {
         const shuffled = shuffleArray(queuedItems);
         const completed = state.queue.filter((q) => q.status !== "queued");
         state.queue = [...completed, ...shuffled];
+        warmQueueIfPlaying();
         break;
       }
     }
@@ -470,6 +497,7 @@ io.on("connection", (socket) => {
     if (playing && playing.item.id === id) {
       await skip(broadcast);
     } else {
+      warmQueueIfPlaying();
       broadcast();
     }
   });
@@ -485,6 +513,7 @@ io.on("connection", (socket) => {
     const completed = state.queue.filter((q) => q.status !== "queued");
 
     state.queue = [...completed, ...reordered, ...remaining];
+    warmQueueIfPlaying();
     broadcast();
   });
 
@@ -518,6 +547,7 @@ io.on("connection", (socket) => {
       state.queue = [...completed, ...queueOnly];
 
       broadcast();
+      warmQueueIfPlaying();
       void ensurePlayerLoop(broadcast);
     }
   );
@@ -544,9 +574,32 @@ io.on("connection", (socket) => {
   });
 });
 
+let isShuttingDown = false;
+
+async function shutdown(signal: string): Promise<void> {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+
+  console.log(`[server] ${signal} received, stopping player`);
+
+  try {
+    await stopPlayer(broadcast);
+  } catch (error) {
+    console.warn("[server] player shutdown failed", error);
+  }
+
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 3_000).unref();
+}
+
+process.once("SIGINT", () => void shutdown("SIGINT"));
+process.once("SIGTERM", () => void shutdown("SIGTERM"));
+
 /* --- BOOTSTRAP --- */
 
 async function bootstrap() {
+  state.control.audioProfile = MPV_CONFIG.defaultAudioProfile;
+
   await setupSpotify();
 
   const audioReady = await ensureAudioRoutingReady();
@@ -556,13 +609,18 @@ async function bootstrap() {
     console.log(`[Audio] ${audioRouting.message}`);
   }
 
-  if (!audioReady) {
+  if (!audioReady || !isVirtualAudioRoutingReady()) {
     systemAudioWarning =
       audioRouting.message ||
       "Le routage audio virtuel n'a pas pu être préparé. Le bot utilisera la sortie audio système par défaut.";
   }
 
-  ensureMpvRunning().catch(console.error);
+  if (systemAudioWarning) {
+    systemAudioWarning =
+      "Le routage audio virtuel n'est pas prÃªt. La lecture est bloquÃ©e pour Ã©viter toute sortie audio systÃ¨me.";
+  } else {
+    ensureMpvRunning().catch(console.error);
+  }
 
   server.listen(APP_CONFIG.PORT, () => {
     console.log(`🚀 Server Ready on port ${APP_CONFIG.PORT}`);

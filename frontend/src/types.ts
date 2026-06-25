@@ -7,8 +7,11 @@ export type Command =
   | "previous"
   | "repeat"
   | "random_mode"
+  | "audio_profile"
   | "seek"
   | "seek_abs";
+
+export type AudioProfileName = "balanced" | "xbox";
 
 export type Control = {
   paused?: boolean;
@@ -16,6 +19,7 @@ export type Control = {
   skipSeq?: number;
   repeat?: boolean;
   randomMode?: boolean;
+  audioProfile?: AudioProfileName;
 };
 
 export type Now = {

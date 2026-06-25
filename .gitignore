@@ -38,6 +38,12 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!backend/.env.example
+
+# Session cookies are private credentials. Existing tracked copies should be
+# removed from Git history/index separately, then regenerated locally.
+cookies.txt
+*cookies.txt
 
 # vercel
 .vercel

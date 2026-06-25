@@ -3,6 +3,7 @@ import { PauseCircle, Repeat, Loader2, Music, ExternalLink } from "lucide-react"
 import type { Now } from "../types";
 import SpectrumBars from "./SpectrumBars";
 import GlitchText from "./GlitchText";
+import VideoPreview from "./VideoPreview";
 import type { ThemeName } from "../lib/themes";
 import { getThemeUi } from "../lib/theme-ui";
 
@@ -238,6 +239,8 @@ export default function NowPlaying({
               bars={spectrumBars}
             />
             </div>
+
+            <VideoPreview url={now.url} rainbow={rainbow} />
           </div>
         ) : (
           <div

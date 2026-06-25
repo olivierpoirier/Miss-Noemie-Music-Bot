@@ -1,11 +1,13 @@
 import { ChildProcess } from "child_process";
 import net from "net";
+import type { AudioProfileName } from "./audioProfiles.js";
 
 /* ------------------- MPV TYPES ------------------- */
 
 export type MpvEvent =
   | { type: "file-loaded" }
   | { type: "playback-restart" }
+  | { type: "end-file"; reason?: string; error?: string }
   | { type: "property-change"; name: string; data: unknown };
 
 export interface MpvHandle {
@@ -16,6 +18,7 @@ export interface MpvHandle {
   command(cmd: string, args?: any[]): Promise<void>;
 
   waitForPlaybackStart(timeoutMs?: number): Promise<void>;
+  prepareForPlayback(): void;
 
   on(listener: (ev: MpvEvent) => void): void;
   off(listener: (ev: MpvEvent) => void): void;
@@ -31,6 +34,7 @@ export type Control = {
   skipSeq: number;
   repeat: boolean;
   randomMode: boolean;
+  audioProfile: AudioProfileName;
 };
 
 export type Now = {
@@ -74,6 +78,7 @@ export const state: GlobalState = {
     skipSeq: 0,
     repeat: false,
     randomMode: false,
+    audioProfile: "balanced",
   },
   now: null,
   queue: [],

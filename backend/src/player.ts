@@ -7,7 +7,7 @@ import {
   MpvHandle,
   MpvEvent,
   nextId,
-} from "./types";
+} from "./types.js";
 import {
   startMpv,
   mpvPause,
@@ -15,9 +15,17 @@ import {
   mpvStop,
   mpvSetLoopFile,
   mpvSeekAbsolute,
-} from "./mpv";
-import { getDirectPlayableUrl, normalizeUrl, resolvePlayable } from "./ytdlp";
-import { MPV_CONFIG } from "./config";
+  mpvSetHttpHeaders,
+  mpvSetAudioProfile,
+} from "./mpv.js";
+import {
+  getPlayableSource,
+  normalizeUrl,
+  resolvePlayable,
+  type PlayableSource,
+} from "./ytdlp.js";
+import { MPV_CONFIG, PLAYER_CONFIG } from "./config.js";
+import { isVirtualAudioRoutingReady } from "./utils.js";
 
 let globalMpvHandle: MpvHandle | null = null;
 let isLooping = false;
@@ -25,8 +33,9 @@ let currentListener: ((ev: MpvEvent) => void) | null = null;
 
 /* ------------------- PRELOAD SYSTEM ------------------- */
 
-let preloaded: { itemId: string; url: string } | null = null;
-let preloadingForId: string | null = null;
+let preloaded = new Map<string, PlayableSource>();
+let preloading = new Map<string, Promise<PlayableSource | null>>();
+let preloadWorkerRunning = false;
 
 function computeCurrentPosition(): number {
   if (!state.now) return 0;
@@ -50,46 +59,132 @@ function pushToHistory(item: QueueItem): void {
   ].slice(0, 200);
 }
 
-async function preloadNextTrack(item: QueueItem): Promise<void> {
-  if (!item) return;
-  if (item.url.startsWith("provider:")) return;
-  if (preloadingForId === item.id) return;
-  if (preloaded?.itemId === item.id) return;
+function trimPreloadCache(): void {
+  const usableIds = new Set(
+    state.queue
+      .filter((q) => q.status === "queued" || q.status === "playing")
+      .map((q) => q.id)
+  );
 
-  preloadingForId = item.id;
-
-  try {
-    const direct = await getDirectPlayableUrl(normalizeUrl(item.url));
-
-    if (direct) {
-      preloaded = { itemId: item.id, url: direct };
-      console.log(`[player] ⚡ Préchargé: ${item.title || item.url}`);
+  for (const itemId of preloaded.keys()) {
+    if (!usableIds.has(itemId)) {
+      preloaded.delete(itemId);
     }
-  } catch (err) {
-    console.warn("[player] preload failed", err);
-  } finally {
-    if (preloadingForId === item.id) {
-      preloadingForId = null;
-    }
+  }
+
+  while (preloaded.size > PLAYER_CONFIG.preloadCacheMax) {
+    const first = preloaded.keys().next();
+    if (first.done) break;
+    preloaded.delete(first.value);
   }
 }
 
-function consumePreloaded(item: QueueItem): string | null {
-  if (!preloaded) return null;
-  if (preloaded.itemId !== item.id) return null;
+function getUpcomingPreloadCandidates(): QueueItem[] {
+  const preloadLimit = Math.min(
+    PLAYER_CONFIG.preloadAhead,
+    PLAYER_CONFIG.preloadCacheMax
+  );
 
-  const out = preloaded.url;
-  preloaded = null;
+  const queued = state.queue.filter((q) => q.status === "queued");
+
+  if (state.control.randomMode) {
+    const candidates = queued
+      .filter((item) => !preloaded.has(item.id) && !preloading.has(item.id))
+      .sort(() => Math.random() - 0.5);
+
+    return candidates.slice(0, preloadLimit);
+  }
+
+  return queued
+    .slice(0, preloadLimit)
+    .filter((item) => !preloaded.has(item.id) && !preloading.has(item.id));
+}
+
+async function resolveItemToSource(
+  item: QueueItem
+): Promise<PlayableSource | null> {
+  const spotifyOk = await resolveSpotifyItem(item);
+  if (!spotifyOk) return null;
+
+  if (item.url.startsWith("provider:")) return null;
+
+  return getPlayableSource(normalizeUrl(item.url));
+}
+
+async function preloadTrack(item: QueueItem): Promise<PlayableSource | null> {
+  if (!item) return null;
+  if (preloaded.has(item.id)) return preloaded.get(item.id) ?? null;
+  if (preloading.has(item.id)) return preloading.get(item.id) ?? null;
+  if (item.status !== "queued") return null;
+
+  const task = (async () => {
+    try {
+      const source = await resolveItemToSource(item);
+
+      if (source && item.status === "queued") {
+        preloaded.set(item.id, source);
+        trimPreloadCache();
+        console.log(`[player] ⚡ Préchargé: ${item.title || item.url}`);
+      }
+
+      return source;
+    } catch (err) {
+      console.warn("[player] preload failed", err);
+      return null;
+    } finally {
+      preloading.delete(item.id);
+    }
+  })();
+
+  preloading.set(item.id, task);
+  return task;
+}
+
+function schedulePreloadWorker(): void {
+  if (preloadWorkerRunning) return;
+
+  preloadWorkerRunning = true;
+
+  void (async () => {
+    try {
+      trimPreloadCache();
+
+      const candidates = getUpcomingPreloadCandidates();
+
+      for (const next of candidates) {
+        await preloadTrack(next);
+      }
+    } finally {
+      preloadWorkerRunning = false;
+      trimPreloadCache();
+    }
+  })();
+}
+
+export function warmUpcomingTracks(): void {
+  schedulePreloadWorker();
+}
+
+async function consumePreloaded(
+  item: QueueItem
+): Promise<PlayableSource | null> {
+  const ready = preloaded.get(item.id);
+  if (ready) {
+    preloaded.delete(item.id);
+    return ready;
+  }
+
+  const pending = preloading.get(item.id);
+  if (!pending) return null;
+
+  const out = await pending;
+  preloaded.delete(item.id);
   return out;
 }
 
 function clearPreloadForItem(itemId: string): void {
-  if (preloaded?.itemId === itemId) {
-    preloaded = null;
-  }
-  if (preloadingForId === itemId) {
-    preloadingForId = null;
-  }
+  preloaded.delete(itemId);
+  preloading.delete(itemId);
 }
 
 function resetNowState(): void {
@@ -97,15 +192,15 @@ function resetNowState(): void {
   setPlaying(null);
 }
 
-function insertQueuedItemAtFront(item: QueueItem): void {
-  const queued = state.queue.filter((q) => q.status === "queued");
-  const others = state.queue.filter((q) => q.status !== "queued");
-  state.queue = [...others, item, ...queued];
-}
-
 /* ------------------- MPV ------------------- */
 
 export async function ensureMpvRunning(): Promise<MpvHandle> {
+  if (!isVirtualAudioRoutingReady()) {
+    throw new Error(
+      "Le routage audio virtuel n'est pas prÃªt : MPV ne sera pas dÃ©marrÃ© sur la sortie systÃ¨me."
+    );
+  }
+
   if (globalMpvHandle && globalMpvHandle.proc.exitCode === null) {
     return globalMpvHandle;
   }
@@ -151,6 +246,15 @@ async function attachListener(
           : Date.now() - ((state.now.positionOffsetSec || 0) * 1000);
 
         onStateChange();
+      }
+      return;
+    }
+
+    if (ev.type === "end-file") {
+      if (ev.reason === "eof") {
+        handleEndOfTrack(item, onStateChange);
+      } else if (ev.reason === "error") {
+        failItemAndContinue(item, onStateChange);
       }
       return;
     }
@@ -203,7 +307,7 @@ async function attachListener(
 }
 
 async function tryPlayWith(
-  playUrl: string,
+  source: PlayableSource,
   item: QueueItem,
   onStateChange: () => void
 ): Promise<boolean> {
@@ -229,7 +333,9 @@ async function tryPlayWith(
 
     await attachListener(handle, item, onStateChange);
 
-    await mpvLoadFile(handle, playUrl, false);
+    await mpvSetAudioProfile(handle, state.control.audioProfile);
+    await mpvSetHttpHeaders(handle, source.headers);
+    await mpvLoadFile(handle, source.url, false);
     await mpvSetLoopFile(handle, state.control.repeat);
     await mpvPause(handle, state.control.paused);
     await handle.waitForPlaybackStart(MPV_CONFIG.globalStartTimeoutMs);
@@ -269,11 +375,13 @@ async function resolveSpotifyItem(item: QueueItem): Promise<boolean> {
   }
 }
 
-async function resolvePlaybackUrl(item: QueueItem): Promise<string | null> {
-  const preloadedUrl = consumePreloaded(item);
-  if (preloadedUrl) {
+async function resolvePlaybackSource(
+  item: QueueItem
+): Promise<PlayableSource | null> {
+  const preloadedSource = await consumePreloaded(item);
+  if (preloadedSource) {
     console.log("[player] ⚡ Using preloaded audio");
-    return preloadedUrl;
+    return preloadedSource;
   }
 
   const normalized = normalizeUrl(item.url);
@@ -286,7 +394,7 @@ async function resolvePlaybackUrl(item: QueueItem): Promise<string | null> {
   }
 
   try {
-    const fallback = await getDirectPlayableUrl(normalized);
+    const fallback = await getPlayableSource(normalized);
     if (fallback) return fallback;
   } catch (err) {
     console.warn("[player] getDirectPlayableUrl failed", err);
@@ -319,7 +427,7 @@ function handleEndOfTrack(item: QueueItem, onStateChange: () => void): void {
 
   setTimeout(() => {
     void ensurePlayerLoop(onStateChange);
-  }, 100);
+  }, 0);
 }
 
 function failItemAndContinue(item: QueueItem, onStateChange: () => void): void {
@@ -330,7 +438,7 @@ function failItemAndContinue(item: QueueItem, onStateChange: () => void): void {
 
   setTimeout(() => {
     void ensurePlayerLoop(onStateChange);
-  }, 300);
+  }, 100);
 }
 
 /* ------------------- QUEUE LOOP ------------------- */
@@ -340,7 +448,9 @@ function pickNextQueuedItem(): QueueItem | null {
   if (!queued.length) return null;
 
   if (state.control.randomMode) {
-    return queued[Math.floor(Math.random() * queued.length)] ?? null;
+    const ready = queued.filter((item) => preloaded.has(item.id));
+    const pool = ready.length ? ready : queued;
+    return pool[Math.floor(Math.random() * pool.length)] ?? null;
   }
 
   return queued[0] ?? null;
@@ -361,14 +471,6 @@ export async function ensurePlayerLoop(onStateChange: () => void): Promise<void>
       return;
     }
 
-    const queued = state.queue.filter((q) => q.status === "queued" && q.id !== nextItem.id);
-    const followUpItem =
-      queued[Math.floor(Math.random() * Math.max(1, queued.length))] ?? null;
-
-    if (followUpItem) {
-      void preloadNextTrack(followUpItem);
-    }
-
     console.log("[player] 🎵 Starting", nextItem.title || nextItem.url);
 
     const spotifyOk = await resolveSpotifyItem(nextItem);
@@ -378,16 +480,17 @@ export async function ensurePlayerLoop(onStateChange: () => void): Promise<void>
     }
 
     nextItem.status = "playing";
+    schedulePreloadWorker();
 
-    const playUrl = await resolvePlaybackUrl(nextItem);
+    const source = await resolvePlaybackSource(nextItem);
 
-    if (!playUrl) {
+    if (!source) {
       console.error("[player] unable to resolve playable URL");
       failItemAndContinue(nextItem, onStateChange);
       return;
     }
 
-    const success = await tryPlayWith(playUrl, nextItem, onStateChange);
+    const success = await tryPlayWith(source, nextItem, onStateChange);
 
     if (!success) {
       failItemAndContinue(nextItem, onStateChange);
@@ -523,8 +626,8 @@ export async function stopPlayer(onStateChange: () => void): Promise<void> {
     globalMpvHandle = null;
   }
 
-  preloaded = null;
-  preloadingForId = null;
+  preloaded.clear();
+  preloading.clear();
 
   if (currentListener && playing?.handle) {
     try {

@@ -1,9 +1,22 @@
 import { spawn } from "child_process";
 import play from "play-dl";
-import { resolveSpotifyUrl, SpotifyResolverError } from "./spotify";
+import { resolveSpotifyUrl, SpotifyResolverError } from "./spotify.js";
 
-import { YTDLP_CONFIG } from "./config";
-import { ProbeResult, ResolvedItem } from "./types";
+import { YTDLP_CONFIG } from "./config.js";
+import { ProbeResult, ResolvedItem } from "./types.js";
+import {
+  getMediaPlatform,
+  isDirectMediaUrl,
+  isPlaylistUrl,
+  isSpotifyUrl,
+  isYoutubeSearchUrl,
+  isYoutubeUrl,
+  normalizeMediaUrl,
+} from "./platforms/index.js";
+import {
+  YOUTUBE_MPV_SAFE_FORMAT,
+  YOUTUBE_MPV_SAFE_PLAYER_CLIENT,
+} from "./platforms/youtube.js";
 
 /* ------------------------------------------------ */
 /* CACHE                                            */
@@ -15,7 +28,16 @@ type CacheVal<T> = {
 };
 
 const PROBE_CACHE = new Map<string, CacheVal<ProbeResult>>();
-const DIRECT_CACHE = new Map<string, CacheVal<string>>();
+export type PlayableSource = {
+  url: string;
+  headers: string[];
+  debugLabel?: string;
+  ext?: string;
+  formatId?: string;
+  protocol?: string;
+};
+
+const DIRECT_CACHE = new Map<string, CacheVal<PlayableSource>>();
 const FLAT_CACHE = new Map<string, CacheVal<ResolvedItem[]>>();
 
 function cacheGet<K, V>(map: Map<K, CacheVal<V>>, key: K): V | undefined {
@@ -47,79 +69,7 @@ function cacheSet<K, V>(map: Map<K, CacheVal<V>>, key: K, value: V): void {
 /* ------------------------------------------------ */
 
 export function normalizeUrl(url: string): string {
-  if (!url) return "";
-
-  try {
-    const u = new URL(url);
-    const host = u.hostname.toLowerCase();
-
-    if (host.includes("youtu.be")) {
-      const id = u.pathname.replace(/^\/+/, "");
-      if (id) return `https://www.youtube.com/watch?v=${id}`;
-    }
-
-    if (host.includes("youtube.com")) {
-      if (u.pathname === "/watch") {
-        const id = u.searchParams.get("v");
-        if (id) return `https://www.youtube.com/watch?v=${id}`;
-      }
-
-      if (u.pathname === "/shorts") {
-        const parts = u.pathname.split("/").filter(Boolean);
-        const id = parts[1];
-        if (id) return `https://www.youtube.com/watch?v=${id}`;
-      }
-
-      if (u.pathname.startsWith("/shorts/")) {
-        const id = u.pathname.split("/")[2];
-        if (id) return `https://www.youtube.com/watch?v=${id}`;
-      }
-    }
-
-    return url;
-  } catch {
-    return url;
-  }
-}
-
-function isSpotifyUrl(url: string): boolean {
-  return url.includes("spotify.com") || url.includes("open.spotify");
-}
-
-function isYoutubeUrl(url: string): boolean {
-  return url.includes("youtube.com") || url.includes("youtu.be");
-}
-
-function isYoutubeSearchUrl(url: string): boolean {
-  try {
-    const u = new URL(url);
-    return (
-      u.hostname.toLowerCase().includes("youtube.com") &&
-      u.pathname === "/results"
-    );
-  } catch {
-    return false;
-  }
-}
-
-function isYouTubePlaylistUrl(url: string): boolean {
-  return (
-    url.includes("list=") ||
-    url.includes("/playlist") ||
-    url.includes("music.youtube.com/playlist")
-  );
-}
-
-function isSoundCloudSetUrl(url: string): boolean {
-  return url.includes("soundcloud.com") && url.includes("/sets/");
-}
-
-function isDirectMediaUrl(url: string): boolean {
-  return /\.(mp3|wav|ogg|opus|m4a|aac|flac|webm|mp4)(\?|#|$)/i.test(url);
-}
-
-function isProbablyPlaylistUrl(url: string): boolean {
-  return isYouTubePlaylistUrl(url) || isSoundCloudSetUrl(url);
+  return normalizeMediaUrl(url);
 }
 
 function buildYtDlpArgs(
@@ -127,18 +77,33 @@ function buildYtDlpArgs(
   extraArgs: string[] = [],
   opts?: {
     useCookies?: boolean;
+    youtubePlayerClient?: string | null;
   }
 ): string[] {
   const args = [...YTDLP_CONFIG.baseArgs];
 
   const useCookies =
     Boolean(opts?.useCookies) &&
-    YTDLP_CONFIG.hasCookies &&
+    (YTDLP_CONFIG.hasCookies || Boolean(YTDLP_CONFIG.cookiesFromBrowser)) &&
     isYoutubeUrl(url) &&
     !isYoutubeSearchUrl(url);
 
-  if (useCookies) {
+  const youtubePlayerClient =
+    opts && "youtubePlayerClient" in opts
+      ? opts.youtubePlayerClient
+      : YTDLP_CONFIG.youtubePlayerClients;
+
+  if (isYoutubeUrl(url) && youtubePlayerClient) {
+    args.push(
+      "--extractor-args",
+      `youtube:player_client=${youtubePlayerClient}`
+    );
+  }
+
+  if (useCookies && YTDLP_CONFIG.cookiesPath) {
     args.push("--cookies", YTDLP_CONFIG.cookiesPath.replace(/\\/g, "/"));
+  } else if (useCookies && YTDLP_CONFIG.cookiesFromBrowser) {
+    args.push("--cookies-from-browser", YTDLP_CONFIG.cookiesFromBrowser);
   }
 
   return [...args, ...extraArgs];
@@ -157,24 +122,21 @@ function killProcessTree(proc: ReturnType<typeof spawn>) {
   } catch {}
 }
 
-function pickFirstHttpLine(output: string): string | null {
-  return (
-    output
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .find((line) => /^https?:\/\//i.test(line)) || null
-  );
-}
-
 function getSourceLabel(url: string): string {
-  const value = url.toLowerCase();
-
-  if (value.includes("youtube.com") || value.includes("youtu.be")) return "YouTube";
-  if (value.includes("spotify.com")) return "Spotify";
-  if (value.includes("soundcloud.com")) return "SoundCloud";
-  if (value.includes("tiktok.com")) return "TikTok";
-  if (value.includes("instagram.com")) return "Instagram";
-  return "Audio";
+  switch (getMediaPlatform(url)) {
+    case "youtube":
+      return "YouTube";
+    case "spotify":
+      return "Spotify";
+    case "soundcloud":
+      return "SoundCloud";
+    case "twitch":
+      return "Twitch";
+    case "direct":
+      return "Audio direct";
+    default:
+      return "Audio web";
+  }
 }
 
 function svgToDataUri(svg: string): string {
@@ -234,7 +196,7 @@ function buildEntryUrl(entry: any, playlistUrl: string): string | null {
     return normalizeUrl(raw);
   }
 
-  if (entry?.id && playlistUrl.includes("youtube")) {
+  if (entry?.id && isYoutubeUrl(playlistUrl)) {
     return normalizeUrl(`https://www.youtube.com/watch?v=${entry.id}`);
   }
 
@@ -260,6 +222,55 @@ function mapEntryToResolvedItem(entry: any, playlistUrl: string): ResolvedItem |
   };
 }
 
+async function resolveYoutubePlaylistFast(
+  normalized: string
+): Promise<ResolvedItem[] | null> {
+  if (!isYoutubeUrl(normalized) || !isPlaylistUrl(normalized)) return null;
+
+  try {
+    const playlist = await play.playlist_info(normalized, {
+      incomplete: true,
+    });
+
+    const videos = await playlist.all_videos();
+
+    const items = videos
+      .map((video: any) => {
+        const videoUrl =
+          typeof video?.url === "string" && /^https?:\/\//i.test(video.url)
+            ? video.url
+            : video?.id
+            ? `https://www.youtube.com/watch?v=${video.id}`
+            : null;
+
+        if (!videoUrl) return null;
+
+        const title = video?.title || "YouTube";
+        const thumb =
+          video?.thumbnails?.slice?.(-1)?.[0]?.url ||
+          video?.thumbnail?.url ||
+          buildFallbackThumb(title, videoUrl);
+
+        return {
+          url: normalizeUrl(videoUrl),
+          title,
+          thumb,
+          durationSec: Number(video?.durationInSec) || 0,
+        };
+      })
+      .filter(Boolean)
+      .slice(0, 200) as ResolvedItem[];
+
+    if (!items.length) return null;
+
+    console.log(`[playlist] YouTube fast resolver: ${items.length} titres`);
+    return items;
+  } catch (err) {
+    console.warn("[playlist] YouTube fast resolver failed", err);
+    return null;
+  }
+}
+
 /* ------------------------------------------------ */
 /* YT-DLP RUNNER                                    */
 /* ------------------------------------------------ */
@@ -267,7 +278,7 @@ function mapEntryToResolvedItem(entry: any, playlistUrl: string): ResolvedItem |
 async function runYtDlp(
   url: string,
   extraArgs: string[],
-  opts?: { useCookies?: boolean }
+  opts?: { useCookies?: boolean; youtubePlayerClient?: string | null }
 ): Promise<string> {
   const finalArgs = buildYtDlpArgs(url, extraArgs, opts);
 
@@ -338,14 +349,10 @@ export async function resolveSpotify(url: string): Promise<ResolvedItem[]> {
   } catch (err) {
     if (err instanceof SpotifyResolverError) {
       console.error("[spotify resolver error]", err.code, err.message);
-
-      if (err.code === "SPOTIFY_PLAYLIST_NOT_ACCESSIBLE") {
-        throw err;
-      }
+    } else {
+      console.error("[spotify resolver error]", err);
     }
-
-    console.error("[spotify resolver error]", err);
-    return [];
+    throw err;
   }
 }
 
@@ -377,11 +384,24 @@ export async function resolveUrlToPlayableItems(
     return [];
   }
 
-  if (isProbablyPlaylistUrl(normalized)) {
+  if (isPlaylistUrl(normalized)) {
+    const fastYoutubePlaylist = await resolveYoutubePlaylistFast(normalized);
+    if (fastYoutubePlaylist) {
+      cacheSet(FLAT_CACHE, normalized, fastYoutubePlaylist);
+      return fastYoutubePlaylist;
+    }
+
     try {
       const json = await runYtDlp(
         normalized,
-        ["-J", "--yes-playlist", normalized],
+        [
+          "-J",
+          "--yes-playlist",
+          "--flat-playlist",
+          "--playlist-end",
+          "200",
+          normalized,
+        ],
         { useCookies: true }
       );
 
@@ -390,7 +410,8 @@ export async function resolveUrlToPlayableItems(
       if (Array.isArray(data?.entries)) {
         const items = data.entries
           .map((entry: any) => mapEntryToResolvedItem(entry, normalized))
-          .filter(Boolean) as ResolvedItem[];
+          .filter(Boolean)
+          .slice(0, 200) as ResolvedItem[];
 
         const hydrated = items.map((it) => ({
           ...it,
@@ -402,7 +423,10 @@ export async function resolveUrlToPlayableItems(
       }
     } catch (err) {
       console.error("[playlist resolve error]", err);
+      throw new Error("Impossible d'analyser cette playlist rapidement.");
     }
+
+    throw new Error("Cette playlist ne contient aucun titre exploitable.");
   }
 
   const single = await probeSingle(normalized);
@@ -513,95 +537,205 @@ export async function probeSingle(url: string): Promise<ProbeResult> {
 /* DIRECT AUDIO URL                                 */
 /* ------------------------------------------------ */
 
-export async function getDirectPlayableUrl(
+function toHeaderList(headers: unknown): string[] {
+  if (!headers || typeof headers !== "object") return [];
+
+  const blocked = new Set([
+    "authorization",
+    "cookie",
+    "proxy-authorization",
+  ]);
+
+  const isSafeHeaderName = (name: string) =>
+    /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name);
+
+  return Object.entries(headers as Record<string, unknown>)
+    .filter(
+      ([name, value]) =>
+        isSafeHeaderName(name) &&
+        !blocked.has(name.toLowerCase()) &&
+        typeof value === "string" &&
+        value.trim().length > 0 &&
+        !/[\r\n]/.test(value)
+    )
+    .map(([name, value]) => `${name}: ${String(value).trim()}`);
+}
+
+function sourceFromYtDlpJson(
+  data: any,
+  debugLabel?: string
+): PlayableSource | null {
+  const requested = data?.requested_downloads?.[0];
+  const requestedFormat = data?.requested_formats?.[0];
+
+  const directUrl =
+    requested?.url ||
+    requestedFormat?.url ||
+    data?.url ||
+    null;
+
+  if (typeof directUrl !== "string" || !/^https?:\/\//i.test(directUrl)) {
+    return null;
+  }
+
+  return {
+    url: directUrl,
+    headers: toHeaderList(
+      requested?.http_headers ||
+        requestedFormat?.http_headers ||
+        data?.http_headers
+    ),
+    debugLabel,
+    ext: data?.ext || requested?.ext || requestedFormat?.ext,
+    formatId:
+      String(data?.format_id || requested?.format_id || requestedFormat?.format_id || "") ||
+      undefined,
+    protocol: data?.protocol || requested?.protocol || requestedFormat?.protocol,
+  };
+}
+
+type PlaybackExtractionAttempt = {
+  label: string;
+  format: string;
+  useCookies: boolean;
+  youtubePlayerClient?: string | null;
+};
+
+function getPlaybackExtractionAttempts(url: string): PlaybackExtractionAttempt[] {
+  if (!isYoutubeUrl(url)) {
+    return [
+      {
+        label: "generic-bestaudio-cookies",
+        format: "bestaudio/best",
+        useCookies: true,
+      },
+      {
+        label: "generic-bestaudio-public",
+        format: "bestaudio/best",
+        useCookies: false,
+      },
+    ];
+  }
+
+  const safeClient =
+    YTDLP_CONFIG.youtubeMpvSafePlayerClient ||
+    YOUTUBE_MPV_SAFE_PLAYER_CLIENT;
+  const safeFormat =
+    YTDLP_CONFIG.youtubeMpvSafeFormat || YOUTUBE_MPV_SAFE_FORMAT;
+
+  const attempts: PlaybackExtractionAttempt[] = [
+    {
+      label: `youtube-mpv-safe-${safeClient}-cookies`,
+      format: safeFormat,
+      useCookies: true,
+      youtubePlayerClient: safeClient,
+    },
+    {
+      label: "youtube-bestaudio-cookies",
+      format: "bestaudio/best",
+      useCookies: true,
+      youtubePlayerClient: null,
+    },
+    {
+      label: `youtube-mpv-safe-${safeClient}-public`,
+      format: safeFormat,
+      useCookies: false,
+      youtubePlayerClient: safeClient,
+    },
+    {
+      label: "youtube-bestaudio-public",
+      format: "bestaudio/best",
+      useCookies: false,
+      youtubePlayerClient: null,
+    },
+  ];
+
+  const seen = new Set<string>();
+  return attempts.filter((attempt) => {
+    const key = [
+      attempt.format,
+      attempt.useCookies ? "cookies" : "public",
+      attempt.youtubePlayerClient || "default",
+    ].join("|");
+
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+export async function getPlayableSource(
   url: string
-): Promise<string | null> {
+): Promise<PlayableSource | null> {
   if (url.startsWith("provider:")) return null;
 
   const normalized = normalizeUrl(url);
 
   if (isYoutubeSearchUrl(normalized)) {
-    console.warn("[getDirectPlayableUrl] search URL refused:", normalized);
+    console.warn("[getPlayableSource] search URL refused:", normalized);
     return null;
   }
 
   if (isDirectMediaUrl(normalized)) {
-    return normalized;
+    return { url: normalized, headers: [] };
   }
 
   const cached = cacheGet(DIRECT_CACHE, normalized);
   if (cached) return cached;
 
-  const tryOnce = async (useCookies: boolean): Promise<string | null> => {
+  const tryOnce = async (
+    attempt: PlaybackExtractionAttempt
+  ): Promise<PlayableSource | null> => {
     try {
-      const direct = await runYtDlp(
+      const json = await runYtDlp(
         normalized,
-        ["-g", "-f", "bestaudio/best", "--no-playlist", normalized],
-        { useCookies }
+        [
+          "--dump-single-json",
+          "-f",
+          attempt.format,
+          "--no-playlist",
+          normalized,
+        ],
+        {
+          useCookies: attempt.useCookies,
+          youtubePlayerClient: attempt.youtubePlayerClient,
+        }
       );
 
-      const firstLine = pickFirstHttpLine(direct);
+      const source = sourceFromYtDlpJson(JSON.parse(json), attempt.label);
 
-      if (firstLine) {
-        cacheSet(DIRECT_CACHE, normalized, firstLine);
+      if (source) {
+        cacheSet(DIRECT_CACHE, normalized, source);
+        console.log(
+          `[yt-dlp] playable source ${source.debugLabel || ""} ${
+            source.formatId || ""
+          } ${source.ext || ""}`.trim()
+        );
       }
 
-      return firstLine;
-    } catch {
+      return source;
+    } catch (err) {
+      console.warn(
+        `[getPlayableSource] extractor failed (${attempt.label})`,
+        err
+      );
       return null;
     }
   };
 
-  const withCookies = await tryOnce(true);
-  if (withCookies) return withCookies;
-
-  return await tryOnce(false);
-}
-
-/* ------------------------------------------------ */
-/* ULTRA FAST RESOLVE                               */
-/* ------------------------------------------------ */
-
-export async function resolvePlayable(url: string): Promise<string | null> {
-  if (url.startsWith("provider:")) return null;
-
-  const normalized = normalizeUrl(url);
-
-  if (isYoutubeSearchUrl(normalized)) {
-    console.warn("[resolvePlayable] search URL refused:", normalized);
-    return null;
+  for (const attempt of getPlaybackExtractionAttempts(normalized)) {
+    const source = await tryOnce(attempt);
+    if (source) return source;
   }
 
-  if (isDirectMediaUrl(normalized)) {
-    return normalized;
-  }
-
-  const cached = cacheGet(DIRECT_CACHE, normalized);
-  if (cached) return cached;
-
-  const tryOnce = async (useCookies: boolean): Promise<string | null> => {
-    try {
-      const direct = await runYtDlp(
-        normalized,
-        ["-g", "-f", "bestaudio/best", "--no-playlist", normalized],
-        { useCookies }
-      );
-
-      const firstLine = pickFirstHttpLine(direct);
-
-      if (firstLine) {
-        cacheSet(DIRECT_CACHE, normalized, firstLine);
-        return firstLine;
-      }
-    } catch (err) {
-      console.error("[resolvePlayable error]", err);
-    }
-
-    return null;
-  };
-
-  const withCookies = await tryOnce(true);
-  if (withCookies) return withCookies;
-
-  return await tryOnce(false);
+  return null;
 }
+
+/** Backward-compatible URL-only accessor for callers that do not load MPV. */
+export async function getDirectPlayableUrl(
+  url: string
+): Promise<string | null> {
+  return (await getPlayableSource(url))?.url || null;
+}
+
+export const resolvePlayable = getPlayableSource;

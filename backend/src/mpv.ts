@@ -3,9 +3,14 @@ import fs from "fs";
 import net from "net";
 import crypto from "crypto";
 import { EventEmitter } from "events";
-import { MPV_CONFIG } from "./config";
-import { getRuntimeAudioRouting } from "./utils";
-import { MpvEvent, MpvHandle } from "./types";
+import { MPV_CONFIG } from "./config.js";
+import {
+  getAudioProfileConfig,
+  normalizeAudioProfileName,
+  type AudioProfileName,
+} from "./audioProfiles.js";
+import { getRuntimeAudioRouting, isVirtualAudioRoutingReady } from "./utils.js";
+import { MpvEvent, MpvHandle } from "./types.js";
 
 const wait = (ms: number) =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -35,20 +40,29 @@ function findPlayerBinary(): string {
 function buildAudioArgs(ipcPath: string): string[] {
   const routing = getRuntimeAudioRouting();
 
+  if (!isVirtualAudioRoutingReady() || !routing.audioDevice) {
+    throw new Error(
+      "Routage audio virtuel absent : MPV refuse de dÃ©marrer sans entrÃ©e virtuelle."
+    );
+  }
+
   const args: string[] = [
     ...MPV_CONFIG.baseArgs,
+    `--volume=${getAudioProfileConfig(MPV_CONFIG.defaultAudioProfile).volume}`,
     `--input-ipc-server=${ipcPath}`,
     `--user-agent=${MPV_CONFIG.userAgent}`,
     "--msg-level=all=warn,cplayer=info",
   ];
 
-  if (MPV_CONFIG.audioFilters) {
-    args.push(`--af=${MPV_CONFIG.audioFilters}`);
+  const startupFilters = getAudioProfileConfig(
+    MPV_CONFIG.defaultAudioProfile
+  ).filters;
+
+  if (startupFilters) {
+    args.push(`--af=${startupFilters}`);
   }
 
-  if (routing.audioDevice && routing.audioDevice.trim() !== "") {
-    args.push(`--audio-device=${routing.audioDevice}`);
-  }
+  args.push(`--audio-device=${routing.audioDevice}`);
 
   return args;
 }
@@ -63,6 +77,8 @@ export class MpvInstance extends EventEmitter {
   private ipcPath: string;
   private buffer = "";
   private startResolve: (() => void) | null = null;
+  private startReject: ((error: Error) => void) | null = null;
+  private startError: Error | null = null;
   private lastLogs: string[] = [];
 
   constructor(proc: ChildProcess, ipcPath: string) {
@@ -124,18 +140,36 @@ export class MpvInstance extends EventEmitter {
     timeoutMs = MPV_CONFIG.globalStartTimeoutMs
   ): Promise<void> {
     if (this.started) return Promise.resolve();
+    if (this.startError) return Promise.reject(this.startError);
 
     return new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.startResolve = null;
+        this.startReject = null;
         reject(new Error(`Timeout lecture mpv ${timeoutMs}ms`));
       }, timeoutMs);
 
       this.startResolve = () => {
         clearTimeout(timeout);
+        this.startResolve = null;
+        this.startReject = null;
         resolve();
       };
+
+      this.startReject = (error) => {
+        clearTimeout(timeout);
+        this.startResolve = null;
+        this.startReject = null;
+        reject(error);
+      };
     });
+  }
+
+  public prepareForPlayback(): void {
+    this.started = false;
+    this.startError = null;
+    this.startResolve = null;
+    this.startReject = null;
   }
 
   /* ------------------- PRIVATE ------------------- */
@@ -214,6 +248,20 @@ export class MpvInstance extends EventEmitter {
         this.startResolve?.();
       }
       eventToEmit = { type: "playback-restart" };
+    } else if (obj?.event === "end-file") {
+      const reason = typeof obj.reason === "string" ? obj.reason : undefined;
+      const error = typeof obj.error === "string" ? obj.error : undefined;
+
+      if (!this.started) {
+        this.startError = new Error(
+          `MPV n'a pas pu ouvrir le flux${reason ? ` (${reason})` : ""}${
+            error ? `: ${error}` : ""
+          }`
+        );
+        this.startReject?.(this.startError);
+      }
+
+      eventToEmit = { type: "end-file", reason, error };
     } else if (
       obj?.event === "property-change" &&
       typeof obj.name === "string"
@@ -323,6 +371,8 @@ export async function startMpv(url: string): Promise<MpvHandle> {
 
     waitForPlaybackStart: instance.waitForPlaybackStart.bind(instance),
 
+    prepareForPlayback: instance.prepareForPlayback.bind(instance),
+
     on: (listener) => {
       instance.on("mpv-event", listener);
     },
@@ -378,9 +428,38 @@ export const mpvSeekAbsolute = (h: MpvHandle, sec: number) =>
     "seek"
   );
 
-export const mpvLoadFile = (h: MpvHandle, url: string, append = false) =>
+export const mpvSetHttpHeaders = (h: MpvHandle, headers: string[]) =>
   safeSend(
+    h,
+    { command: ["set_property", "http-header-fields", headers] },
+    "headers"
+  );
+
+export const mpvSetAudioProfile = async (
+  h: MpvHandle,
+  profile: AudioProfileName
+) => {
+  const normalized = normalizeAudioProfileName(profile);
+  const config = getAudioProfileConfig(normalized);
+
+  await safeSend(
+    h,
+    { command: ["set_property", "volume", config.volume] },
+    "audio-profile-volume"
+  );
+
+  await safeSend(
+    h,
+    { command: ["set_property", "af", config.filters || ""] },
+    "audio-profile-filter"
+  );
+};
+
+export const mpvLoadFile = (h: MpvHandle, url: string, append = false) => {
+  h.prepareForPlayback();
+  return safeSend(
     h,
     { command: ["loadfile", url, append ? "append" : "replace"] },
     "load"
   );
+};

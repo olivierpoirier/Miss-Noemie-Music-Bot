@@ -14,9 +14,10 @@ import {
   Music4,
   Disc3,
   Sparkles,
+  Headphones,
 } from "lucide-react";
 import { useState, useEffect, useRef } from "react";
-import type { Now, Command } from "../types";
+import type { Now, Command, AudioProfileName } from "../types";
 import type { ThemeName } from "../lib/themes";
 import SpectrumBars from "./SpectrumBars";
 
@@ -25,8 +26,9 @@ interface Props {
   paused: boolean;
   repeat: boolean;
   randomMode: boolean;
+  audioProfile: AudioProfileName;
   busy: string | null;
-  sendCommand: (cmd: Command, arg?: number) => void;
+  sendCommand: (cmd: Command, arg?: number | string) => void;
   rainbow?: boolean;
   theme: ThemeName;
 }
@@ -46,6 +48,7 @@ export default function PlayerBar({
   paused,
   repeat,
   randomMode,
+  audioProfile,
   busy,
   sendCommand,
   rainbow = false,
@@ -120,6 +123,7 @@ export default function PlayerBar({
 
   const isAdventurer = !rainbow && theme === "adventurer";
   const isFloral = !rainbow && theme === "floral";
+  const xboxProfileOn = audioProfile === "xbox";
 
   const barShellCls = isAdventurer
     ? "bg-[rgba(18,24,18,0.88)] border-t border-[#d5c5a1]/10"
@@ -442,7 +446,7 @@ export default function PlayerBar({
                                 : "Lecture en cours"}
                             </div>
 
-                            <div className="flex items-center gap-2">
+                            <div className="flex flex-wrap items-center justify-end gap-2">
                               <button
                                 onClick={() =>
                                   sendCommand("random_mode", randomMode ? 0 : 1)
@@ -472,6 +476,27 @@ export default function PlayerBar({
                                 <span className="inline-flex items-center gap-2">
                                   <Repeat size={16} />
                                   Repeat
+                                </span>
+                              </button>
+
+                              <button
+                                onClick={() =>
+                                  sendCommand(
+                                    "audio_profile",
+                                    xboxProfileOn ? "balanced" : "xbox"
+                                  )
+                                }
+                                className={`px-4 py-2 rounded-xl border transition ${
+                                  xboxProfileOn
+                                    ? "border-emerald-400 bg-emerald-400/15 text-emerald-200"
+                                    : "border-white/10 bg-white/5 text-white/50 hover:text-white"
+                                } ${rainbow ? "rainbow-cycle" : ""}`}
+                                type="button"
+                                title="Optimise le son pour le chemin micro / Xbox party"
+                              >
+                                <span className="inline-flex items-center gap-2">
+                                  <Headphones size={16} />
+                                  {xboxProfileOn ? "Xbox" : "Équilibré"}
                                 </span>
                               </button>
                             </div>

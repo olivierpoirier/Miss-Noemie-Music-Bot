@@ -2,10 +2,11 @@ import { cn } from "../lib/cn";
 
 interface Props {
   isOpen: boolean;
+  message?: string | null;
   rainbow?: boolean;
 }
 
-export default function SystemAlert({ isOpen, rainbow }: Props) {
+export default function SystemAlert({ isOpen, message, rainbow }: Props) {
   if (!isOpen) return null;
 
   return (
@@ -23,14 +24,12 @@ export default function SystemAlert({ isOpen, rainbow }: Props) {
             : "bg-bg text-ink border-white/20 shadow-black/20"
         )}
       >
-        <div className="text-4xl mb-4">⚠️</div>
+        <div className="text-4xl mb-4">Avertissement</div>
         <h2 className="text-xl font-black uppercase tracking-tighter mb-2">
-          Configuration Requise
+          Entree audio virtuelle requise
         </h2>
         <p className="text-sm opacity-80 font-mono mb-6">
-          Le bot ne détecte pas <strong>VoiceMeeter Banana</strong> sur
-          l&apos;ordinateur qui host l&apos;application. Cette application est
-          nécessaire pour router le flux audio sur le serveur.
+          {message || "Le serveur n'a pas d'entree audio virtuelle prete."}
         </p>
 
         <a
@@ -42,11 +41,11 @@ export default function SystemAlert({ isOpen, rainbow }: Props) {
             rainbow ? "bg-pink-500 text-white rainbow-cycle" : "bg-white text-black"
           )}
         >
-          Télécharger VoiceMeeter
+          Configurer VoiceMeeter
         </a>
 
         <p className="mt-4 text-[10px] uppercase opacity-50 italic">
-          Relancez le serveur après l&apos;installation
+          Redemarrer le serveur apres la configuration
         </p>
       </div>
     </div>

@@ -35,6 +35,7 @@ type Command =
   | "previous"
   | "repeat"
   | "random_mode"
+  | "audio_profile"
   | "seek"
   | "seek_abs";
 
@@ -159,8 +160,9 @@ export default function App() {
         return;
       }
 
-      const looksLikeUrl = /^https?:\/\//i.test(raw);
-      const finalInput = looksLikeUrl ? pickUrlLike(raw) : raw;
+      const urlCandidate = pickUrlLike(raw);
+      const looksLikeUrl = /^https?:\/\//i.test(urlCandidate);
+      const finalInput = looksLikeUrl ? urlCandidate : raw;
 
       if (looksLikeUrl && !/^https?:\/\//i.test(finalInput)) {
         setToast("URL invalide ❌");
@@ -176,7 +178,7 @@ export default function App() {
   }, [url, name, play, setToast]);
 
   const sendCommand = useCallback(
-    (cmd: Command, arg?: number) => {
+    (cmd: Command, arg?: number | string) => {
       try {
         command(cmd, arg);
         window.setTimeout(() => setBusy(null), 4000);
@@ -256,6 +258,7 @@ export default function App() {
 
   const paused = Boolean(control.paused);
   const repeat = Boolean(control.repeat);
+  const audioProfile = control.audioProfile ?? "balanced";
   const now: Now | null = state.now ?? null;
   const queue: QueueItem[] = state.queue ?? [];
   const history: QueueItem[] = state.history ?? [];
@@ -278,7 +281,11 @@ export default function App() {
       />
 
       <div className="relative z-10">
-        <SystemAlert isOpen={systemError} rainbow={rainbow} />
+        <SystemAlert
+          isOpen={Boolean(systemError)}
+          message={systemError}
+          rainbow={rainbow}
+        />
 
         <AppHeader
           theme={theme}
@@ -443,6 +450,7 @@ export default function App() {
           paused={paused}
           repeat={repeat}
           randomMode={randomMode}
+          audioProfile={audioProfile}
           busy={busy}
           rainbow={rainbow}
           theme={theme}

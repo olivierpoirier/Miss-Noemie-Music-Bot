@@ -7,7 +7,12 @@ export const pickUrlLike = (raw: string): string => {
   const m = t.match(/https?:\/\/[^\s<>"']+/i);
   if (m) return m[0];
   const first = t.split(/\s+/)[0] ?? "";
-  if (/^(www\.|youtube\.com|youtu\.be|soundcloud\.com|open\.spotify\.com)\//i.test(first)) {
+  if (
+    /^(?:www\.)?(?:youtube\.com|youtu\.be|soundcloud\.com|open\.spotify\.com|twitch\.tv|clips\.twitch\.tv)\//i.test(
+      first
+    ) ||
+    /^(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+(?::\d+)?(?:[/?#]|$)/i.test(first)
+  ) {
     return `https://${first}`;
   }
   return first;

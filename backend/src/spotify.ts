@@ -1,4 +1,4 @@
-import type { ResolvedItem } from "./types";
+import type { ResolvedItem } from "./types.js";
 
 type SpotifyTokenCache = {
   accessToken: string;
@@ -57,10 +57,10 @@ function getSpotifyConfig() {
   const clientSecret = (process.env.SPOTIFY_CLIENT_SECRET || "").trim();
   const refreshToken = (process.env.SPOTIFY_REFRESH_TOKEN || "").trim();
 
-  if (!clientId || !clientSecret || !refreshToken) {
+  if (!clientId || !clientSecret) {
     throw new SpotifyResolverError(
       "SPOTIFY_CONFIG_MISSING",
-      "Spotify credentials manquants dans .env"
+      "SPOTIFY_CLIENT_ID et SPOTIFY_CLIENT_SECRET sont requis dans .env"
     );
   }
 
@@ -75,30 +75,53 @@ async function refreshSpotifyAccessToken(): Promise<string> {
   const { clientId, clientSecret, refreshToken } = getSpotifyConfig();
   const basic = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
 
-  const res = await fetch("https://accounts.spotify.com/api/token", {
-    method: "POST",
-    headers: {
-      Authorization: `Basic ${basic}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: refreshToken,
-    }),
-  });
+  const requestToken = async (params: URLSearchParams) => {
+    const res = await fetch("https://accounts.spotify.com/api/token", {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${basic}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: params,
+    });
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new SpotifyResolverError(
-      "SPOTIFY_TOKEN_REFRESH_FAILED",
-      `Spotify token refresh failed: ${res.status} ${text}`
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new SpotifyResolverError(
+        "SPOTIFY_TOKEN_REQUEST_FAILED",
+        `Spotify token request failed: ${res.status} ${text}`
+      );
+    }
+
+    return (await res.json()) as {
+      access_token: string;
+      expires_in: number;
+    };
+  };
+
+  let data: { access_token: string; expires_in: number };
+
+  if (refreshToken) {
+    try {
+      data = await requestToken(
+        new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: refreshToken,
+        })
+      );
+    } catch (error) {
+      // Public tracks, albums and public playlists work with client credentials.
+      // This keeps normal Spotify links working when an old refresh token expires.
+      console.warn("[spotify] refresh token failed; trying client credentials", error);
+      data = await requestToken(
+        new URLSearchParams({ grant_type: "client_credentials" })
+      );
+    }
+  } else {
+    data = await requestToken(
+      new URLSearchParams({ grant_type: "client_credentials" })
     );
   }
-
-  const data = (await res.json()) as {
-    access_token: string;
-    expires_in: number;
-  };
 
   tokenCache = {
     accessToken: data.access_token,

@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "child_process";
 import fs from "fs";
-import { APP_CONFIG, AUDIO_CONFIG } from "./config";
+import { APP_CONFIG, AUDIO_CONFIG } from "./config.js";
 
 export type RuntimeAudioRouting = {
   audioDevice: string | null;
@@ -20,6 +20,20 @@ let runtimeAudioRouting: RuntimeAudioRouting = {
 
 export function getRuntimeAudioRouting(): RuntimeAudioRouting {
   return { ...runtimeAudioRouting };
+}
+
+/**
+ * The player must never silently fall back to desktop speakers.  A real virtual
+ * sink/input needs both an output device and a monitor/source exposed to the
+ * calling application.
+ */
+export function isVirtualAudioRoutingReady(): boolean {
+  return Boolean(
+    !runtimeAudioRouting.degraded &&
+      runtimeAudioRouting.audioDevice &&
+      runtimeAudioRouting.virtualSinkName &&
+      runtimeAudioRouting.virtualMonitorSource
+  );
 }
 
 function setRuntimeAudioRouting(
