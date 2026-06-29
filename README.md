@@ -28,7 +28,7 @@ Fichiers dédiés à la démo:
 - `api/demo.js`: backend HTTP de démonstration, avec état temporaire en mémoire.
 - `frontend/src/hooks/useVercelDemoQueue.ts`: client frontend utilisé seulement par le build Vercel.
 
-Le script Vercel utilise `vite build --mode vercel`; ce mode active automatiquement le client de démo. Le script local normal `npm --prefix frontend run build` continue d'utiliser le backend Socket.IO réel.
+Le script Vercel entre dans `frontend`, lance `npm ci`, puis utilise `vite build --mode vercel`; ce mode active automatiquement le client de démo. Le script local normal `npm --prefix frontend run build` continue d'utiliser le backend Socket.IO réel.
 
 ```bash
 npm --prefix frontend run build:vercel
