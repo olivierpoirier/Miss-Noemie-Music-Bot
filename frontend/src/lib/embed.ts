@@ -5,6 +5,7 @@ export type VideoEmbed = {
 };
 
 type EmbedOptions = {
+  autoplay?: boolean;
   muted?: boolean;
 };
 
@@ -37,12 +38,16 @@ function youtubeVideoId(url: URL): string | null {
   return null;
 }
 
-function youtubeEmbed(url: URL, muted: boolean): VideoEmbed | null {
+function youtubeEmbed(
+  url: URL,
+  autoplay: boolean,
+  muted: boolean
+): VideoEmbed | null {
   const videoId = youtubeVideoId(url);
   if (!videoId) return null;
 
   const params = new URLSearchParams({
-    autoplay: "1",
+    autoplay: autoplay ? "1" : "0",
     mute: muted ? "1" : "0",
     playsinline: "1",
     rel: "0",
@@ -58,13 +63,14 @@ function youtubeEmbed(url: URL, muted: boolean): VideoEmbed | null {
 function twitchEmbed(
   url: URL,
   parentHost: string,
+  autoplay: boolean,
   muted: boolean
 ): VideoEmbed | null {
   const host = url.hostname.toLowerCase();
   const parts = url.pathname.split("/").filter(Boolean);
   const params = new URLSearchParams({
     parent: parentHost || "localhost",
-    autoplay: "true",
+    autoplay: autoplay ? "true" : "false",
     muted: muted ? "true" : "false",
   });
 
@@ -95,6 +101,7 @@ export function getVideoEmbed(
 ): VideoEmbed | null {
   if (!value || value.startsWith("provider:")) return null;
 
+  const autoplay = options.autoplay ?? true;
   const muted = options.muted ?? true;
   const url = parseUrl(value);
   if (!url) return null;
@@ -108,11 +115,11 @@ export function getVideoEmbed(
     host === "youtube.com" ||
     host.endsWith(".youtube.com")
   ) {
-    return youtubeEmbed(url, muted);
+    return youtubeEmbed(url, autoplay, muted);
   }
 
   if (host === "twitch.tv" || host.endsWith(".twitch.tv")) {
-    return twitchEmbed(url, parentHost, muted);
+    return twitchEmbed(url, parentHost, autoplay, muted);
   }
 
   return null;

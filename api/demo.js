@@ -16,6 +16,24 @@ const PLAYLIST_HINTS = [
   "collection",
 ];
 
+const DEMO_PLAYLIST_ITEMS = [
+  {
+    url: "https://www.youtube.com/watch?v=K4DyBUG242c",
+    title: "Cartoon - On & On",
+    durationSec: 207,
+  },
+  {
+    url: "https://www.youtube.com/watch?v=60ItHLz5WEA",
+    title: "Alan Walker - Fade",
+    durationSec: 260,
+  },
+  {
+    url: "https://www.youtube.com/watch?v=bM7SZ5SBzyY",
+    title: "Different Heaven - Nekozilla",
+    durationSec: 190,
+  },
+];
+
 function createStore() {
   return {
     nextId: 1,
@@ -108,11 +126,12 @@ function titleFromUrl(url, fallback) {
     .join(" ");
 }
 
-function buildDemoItem(raw, addedBy, clientRequestId, index = 0) {
-  const normalized = normalizeInput(raw);
+function buildDemoItem(raw, addedBy, clientRequestId, index = 0, playlist = false) {
+  const demoTrack = playlist ? DEMO_PLAYLIST_ITEMS[index % DEMO_PLAYLIST_ITEMS.length] : null;
+  const normalized = demoTrack?.url || normalizeInput(raw);
   const parsed = safeUrl(normalized);
   const idSeed = `${normalized}:${index}`;
-  const durationSec = 130 + (hashString(idSeed) % 210);
+  const durationSec = demoTrack?.durationSec || 130 + (hashString(idSeed) % 210);
 
   if (!parsed) {
     return {
@@ -130,10 +149,7 @@ function buildDemoItem(raw, addedBy, clientRequestId, index = 0) {
 
   const videoId = youtubeId(parsed);
   const baseTitle = titleFromUrl(parsed, parsed.hostname);
-  const title =
-    index > 0
-      ? `${baseTitle} - extrait ${index + 1}`
-      : baseTitle;
+  const title = demoTrack?.title || baseTitle;
 
   return {
     id: "",
@@ -241,11 +257,12 @@ function statePayload(store) {
 }
 
 function addQueueItems(store, raw, addedBy, clientRequestId) {
-  const count = looksLikePlaylist(raw) ? 3 : 1;
+  const playlist = looksLikePlaylist(raw);
+  const count = playlist ? DEMO_PLAYLIST_ITEMS.length : 1;
   const created = [];
 
   for (let index = 0; index < count; index += 1) {
-    const item = buildDemoItem(raw, addedBy, clientRequestId, index);
+    const item = buildDemoItem(raw, addedBy, clientRequestId, index, playlist);
     item.id = String(store.nextId);
     store.nextId += 1;
     created.push(item);

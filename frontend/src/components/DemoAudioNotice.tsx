@@ -38,8 +38,8 @@ export default function DemoAudioNotice({ rainbow = false, theme }: Props) {
           </div>
           <p className="text-sm leading-6 text-white/78">
             Dans l'application locale, l'audio est envoye vers une entree
-            virtuelle. Pour cette demo web, l'apercu audio sort par les
-            haut-parleurs du navigateur.
+            virtuelle. Pour cette demo web, le lecteur integre s'ouvre dans la
+            page et le son sort par les haut-parleurs du navigateur.
           </p>
         </div>
       </div>
