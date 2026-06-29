@@ -1,36 +1,35 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Music Bot
 
-## Getting Started
+Interface web et backend local pour piloter un bot musical avec routage audio virtuel.
 
-First, run the development server:
+## Mode local
+
+Le mode local reste le mode complet de l'application. Il utilise le backend Socket.IO dans `backend/src/server.ts`, le lecteur local, mpv et la vérification du routage audio virtuel.
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm --prefix backend run dev
+npm --prefix frontend run start
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Le build de production local ne change pas:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```bash
+npm --prefix backend run build
+npm --prefix frontend run build
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Démo Vercel
 
-## Learn More
+La démo Vercel est volontairement isolée du backend local. Elle sert uniquement à permettre à des visiteurs d'essayer le frontend depuis un lien web, sans mpv, sans Voicemeeter et sans lecture audio serveur.
 
-To learn more about Next.js, take a look at the following resources:
+Fichiers dédiés à la démo:
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+- `vercel.json`: configuration de build Vercel.
+- `api/demo.js`: backend HTTP de démonstration, avec état temporaire en mémoire.
+- `frontend/src/hooks/useVercelDemoQueue.ts`: client frontend utilisé seulement par le build Vercel.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Le script Vercel utilise `vite build --mode vercel`; ce mode active automatiquement le client de démo. Le script local normal `npm --prefix frontend run build` continue d'utiliser le backend Socket.IO réel.
 
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```bash
+npm --prefix frontend run build:vercel
+```

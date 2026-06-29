@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { io, Socket } from "socket.io-client";
 import type { QueueResponse, Command, QueueItem } from "../types";
+import useVercelDemoQueue from "./useVercelDemoQueue";
 
 type BusyState =
   | Command
@@ -12,6 +13,9 @@ type BusyState =
   | null;
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || "";
+const USE_VERCEL_DEMO =
+  import.meta.env.VITE_BACKEND_MODE === "vercel-demo" ||
+  import.meta.env.MODE === "vercel";
 const BUSY_TIMEOUT = 30_000;
 const PENDING_MAX_AGE_MS = 60_000;
 
@@ -27,7 +31,7 @@ type PendingItem = QueueItem & {
   status: "pending";
 };
 
-export default function useLiveQueue() {
+function useSocketQueue() {
   const [serverState, setServerState] = useState<QueueResponse>({
     ok: true,
     now: null,
@@ -249,3 +253,7 @@ export default function useLiveQueue() {
     requeueHistoryItem,
   };
 }
+
+const useLiveQueue = USE_VERCEL_DEMO ? useVercelDemoQueue : useSocketQueue;
+
+export default useLiveQueue;

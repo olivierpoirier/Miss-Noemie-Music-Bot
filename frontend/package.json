@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "cloudflared tunnel --url http://localhost:4000",
     "build": "tsc -b && vite build",
+    "build:vercel": "tsc -b && vite build --mode vercel",
     "lint": "eslint .",
     "preview": "vite preview",
     "start": "vite"
