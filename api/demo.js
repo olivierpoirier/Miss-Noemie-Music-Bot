@@ -16,23 +16,7 @@ const PLAYLIST_HINTS = [
   "collection",
 ];
 
-const DEMO_PLAYLIST_ITEMS = [
-  {
-    url: "https://www.youtube.com/watch?v=K4DyBUG242c",
-    title: "Cartoon - On & On",
-    durationSec: 207,
-  },
-  {
-    url: "https://www.youtube.com/watch?v=60ItHLz5WEA",
-    title: "Alan Walker - Fade",
-    durationSec: 260,
-  },
-  {
-    url: "https://www.youtube.com/watch?v=bM7SZ5SBzyY",
-    title: "Different Heaven - Nekozilla",
-    durationSec: 190,
-  },
-];
+const DEMO_PLAYLIST_ITEM_COUNT = 3;
 
 function createStore() {
   return {
@@ -126,18 +110,57 @@ function titleFromUrl(url, fallback) {
     .join(" ");
 }
 
+function playlistSourceLabel(url) {
+  const host = url?.hostname?.replace(/^www\./, "") || "";
+  const path = url?.pathname?.toLowerCase() || "";
+
+  if (host.includes("youtube")) return "Playlist YouTube";
+  if (host.includes("youtu.be")) return "Playlist YouTube";
+  if (host.includes("spotify") && path.includes("/album/")) return "Album Spotify";
+  if (host.includes("spotify")) return "Playlist Spotify";
+  if (host.includes("soundcloud")) return "Playlist SoundCloud";
+
+  return "Playlist";
+}
+
+function playlistDemoUrl(raw, index) {
+  const normalized = normalizeInput(raw);
+  const parsed = safeUrl(normalized);
+
+  if (!parsed) {
+    return normalized;
+  }
+
+  const host = parsed.hostname.replace(/^www\./, "");
+  const listId = parsed.searchParams.get("list");
+
+  if ((host.includes("youtube.com") || host === "youtu.be") && listId) {
+    parsed.hostname = "www.youtube.com";
+    parsed.pathname = "/playlist";
+    parsed.search = `?list=${encodeURIComponent(listId)}`;
+  }
+
+  parsed.hash = `demo-track-${index + 1}`;
+  return parsed.toString();
+}
+
+function playlistDemoTitle(raw, index) {
+  const parsed = safeUrl(normalizeInput(raw));
+  const source = playlistSourceLabel(parsed);
+  return `${source} - piste ${index + 1} (demo sans audio)`;
+}
+
 function buildDemoItem(raw, addedBy, clientRequestId, index = 0, playlist = false) {
-  const demoTrack = playlist ? DEMO_PLAYLIST_ITEMS[index % DEMO_PLAYLIST_ITEMS.length] : null;
-  const normalized = demoTrack?.url || normalizeInput(raw);
+  const normalized = playlist ? playlistDemoUrl(raw, index) : normalizeInput(raw);
   const parsed = safeUrl(normalized);
   const idSeed = `${normalized}:${index}`;
-  const durationSec = demoTrack?.durationSec || 130 + (hashString(idSeed) % 210);
+  const durationSec = 130 + (hashString(idSeed) % 210);
 
   if (!parsed) {
     return {
       id: "",
       url: normalized,
-      title: String(raw || "Signal demo"),
+      title: playlist ? playlistDemoTitle(raw, index) : String(raw || "Signal demo"),
       thumb: null,
       addedBy,
       status: "queued",
@@ -149,13 +172,13 @@ function buildDemoItem(raw, addedBy, clientRequestId, index = 0, playlist = fals
 
   const videoId = youtubeId(parsed);
   const baseTitle = titleFromUrl(parsed, parsed.hostname);
-  const title = demoTrack?.title || baseTitle;
+  const title = playlist ? playlistDemoTitle(raw, index) : baseTitle;
 
   return {
     id: "",
     url: normalized,
     title,
-    thumb: videoId ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg` : null,
+    thumb: !playlist && videoId ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg` : null,
     addedBy,
     status: "queued",
     createdAt: Date.now(),
@@ -258,7 +281,7 @@ function statePayload(store) {
 
 function addQueueItems(store, raw, addedBy, clientRequestId) {
   const playlist = looksLikePlaylist(raw);
-  const count = playlist ? DEMO_PLAYLIST_ITEMS.length : 1;
+  const count = playlist ? DEMO_PLAYLIST_ITEM_COUNT : 1;
   const created = [];
 
   for (let index = 0; index < count; index += 1) {

@@ -37,9 +37,10 @@ export default function DemoAudioNotice({ rainbow = false, theme }: Props) {
             Demo Vercel
           </div>
           <p className="text-sm leading-6 text-white/78">
-            Dans l'application locale, l'audio est envoye vers une entree
-            virtuelle. Pour cette demo web, le lecteur integre s'ouvre dans la
-            page et le son sort par les haut-parleurs du navigateur.
+            Le backend demo Vercel est actif: les liens, la file et les controles
+            repondent comme dans l'application. L'audio reel n'est pas disponible
+            ici, car la lecture locale passe normalement par mpv et une entree
+            virtuelle.
           </p>
         </div>
       </div>

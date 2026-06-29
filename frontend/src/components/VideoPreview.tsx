@@ -16,30 +16,19 @@ export default function VideoPreview({ url, rainbow = false }: Props) {
     () =>
       getVideoEmbed(url, {
         autoplay: !IS_VERCEL_DEMO,
-        muted: !IS_VERCEL_DEMO,
+        muted: true,
       }),
     [url]
   );
-  const [enabled, setEnabled] = useState(IS_VERCEL_DEMO);
+  const [enabled, setEnabled] = useState(false);
 
   useEffect(() => {
-    if (IS_VERCEL_DEMO) {
-      setEnabled(true);
-      return;
-    }
-
     try {
       setEnabled(localStorage.getItem(STORAGE_KEY) === "true");
     } catch {
       // The preview simply stays disabled if this browser blocks storage.
     }
   }, []);
-
-  useEffect(() => {
-    if (IS_VERCEL_DEMO) {
-      setEnabled(true);
-    }
-  }, [url]);
 
   if (!embed) return null;
 
@@ -67,22 +56,20 @@ export default function VideoPreview({ url, rainbow = false }: Props) {
           <span>Apercu {embed.label}</span>
           <span className="text-xs text-white/40">
             {IS_VERCEL_DEMO
-              ? "clique dans le lecteur si le navigateur bloque le son"
+              ? "demo visuelle seulement"
               : "audio du navigateur coupe"}
           </span>
         </div>
 
-        {!IS_VERCEL_DEMO && (
-          <button
-            type="button"
-            onClick={toggle}
-            className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs font-semibold text-white/80 transition hover:bg-white/10 hover:text-white"
-            aria-pressed={enabled}
-          >
-            {enabled ? <EyeOff size={15} /> : <Eye size={15} />}
-            {enabled ? "Masquer la video" : "Voir la video"}
-          </button>
-        )}
+        <button
+          type="button"
+          onClick={toggle}
+          className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs font-semibold text-white/80 transition hover:bg-white/10 hover:text-white"
+          aria-pressed={enabled}
+        >
+          {enabled ? <EyeOff size={15} /> : <Eye size={15} />}
+          {enabled ? "Masquer la video" : "Voir la video"}
+        </button>
       </div>
 
       {enabled && (
