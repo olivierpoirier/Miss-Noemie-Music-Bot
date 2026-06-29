@@ -17,6 +17,10 @@ import {
   YOUTUBE_MPV_SAFE_FORMAT,
   YOUTUBE_MPV_SAFE_PLAYER_CLIENT,
 } from "./platforms/youtube.js";
+import {
+  normalizeAudioProfileName,
+  type AudioProfileName,
+} from "./audioProfiles.js";
 
 /* ------------------------------------------------ */
 /* CACHE                                            */
@@ -601,7 +605,13 @@ type PlaybackExtractionAttempt = {
   youtubePlayerClient?: string | null;
 };
 
-function getPlaybackExtractionAttempts(url: string): PlaybackExtractionAttempt[] {
+const YOUTUBE_BALANCED_QUALITY_FORMAT =
+  "best[ext=mp4][height<=720]/best[ext=mp4][height<=480]/18/bestaudio/best";
+
+function getPlaybackExtractionAttempts(
+  url: string,
+  audioProfile?: AudioProfileName | null
+): PlaybackExtractionAttempt[] {
   if (!isYoutubeUrl(url)) {
     return [
       {
@@ -622,25 +632,29 @@ function getPlaybackExtractionAttempts(url: string): PlaybackExtractionAttempt[]
     YOUTUBE_MPV_SAFE_PLAYER_CLIENT;
   const safeFormat =
     YTDLP_CONFIG.youtubeMpvSafeFormat || YOUTUBE_MPV_SAFE_FORMAT;
+  const profile = normalizeAudioProfileName(audioProfile);
 
-  const attempts: PlaybackExtractionAttempt[] = [
+  const qualityAttempts: PlaybackExtractionAttempt[] = [
     {
-      label: `youtube-mpv-safe-${safeClient}-cookies`,
-      format: safeFormat,
+      label: "youtube-balanced-quality-cookies",
+      format: YOUTUBE_BALANCED_QUALITY_FORMAT,
       useCookies: true,
-      youtubePlayerClient: safeClient,
+      youtubePlayerClient: null,
     },
+    {
+      label: "youtube-balanced-quality-public",
+      format: YOUTUBE_BALANCED_QUALITY_FORMAT,
+      useCookies: false,
+      youtubePlayerClient: null,
+    },
+  ];
+
+  const bestAudioAttempts: PlaybackExtractionAttempt[] = [
     {
       label: "youtube-bestaudio-cookies",
       format: "bestaudio/best",
       useCookies: true,
       youtubePlayerClient: null,
-    },
-    {
-      label: `youtube-mpv-safe-${safeClient}-public`,
-      format: safeFormat,
-      useCookies: false,
-      youtubePlayerClient: safeClient,
     },
     {
       label: "youtube-bestaudio-public",
@@ -649,6 +663,38 @@ function getPlaybackExtractionAttempts(url: string): PlaybackExtractionAttempt[]
       youtubePlayerClient: null,
     },
   ];
+
+  const safeAttempts: PlaybackExtractionAttempt[] = [
+    {
+      label: `youtube-mpv-safe-${safeClient}-cookies`,
+      format: safeFormat,
+      useCookies: true,
+      youtubePlayerClient: safeClient,
+    },
+    {
+      label: `youtube-mpv-safe-${safeClient}-public`,
+      format: safeFormat,
+      useCookies: false,
+      youtubePlayerClient: safeClient,
+    },
+  ];
+
+  const attempts =
+    profile === "xbox"
+      ? [
+          safeAttempts[0],
+          bestAudioAttempts[0],
+          safeAttempts[1],
+          bestAudioAttempts[1],
+        ]
+      : [
+          qualityAttempts[0],
+          bestAudioAttempts[0],
+          safeAttempts[0],
+          qualityAttempts[1],
+          bestAudioAttempts[1],
+          safeAttempts[1],
+        ];
 
   const seen = new Set<string>();
   return attempts.filter((attempt) => {
@@ -664,8 +710,17 @@ function getPlaybackExtractionAttempts(url: string): PlaybackExtractionAttempt[]
   });
 }
 
+function getPlayableSourceCacheKey(
+  normalized: string,
+  audioProfile?: AudioProfileName | null
+): string {
+  if (!isYoutubeUrl(normalized)) return normalized;
+  return `${normalizeAudioProfileName(audioProfile)}:${normalized}`;
+}
+
 export async function getPlayableSource(
-  url: string
+  url: string,
+  audioProfile?: AudioProfileName | null
 ): Promise<PlayableSource | null> {
   if (url.startsWith("provider:")) return null;
 
@@ -680,7 +735,8 @@ export async function getPlayableSource(
     return { url: normalized, headers: [] };
   }
 
-  const cached = cacheGet(DIRECT_CACHE, normalized);
+  const cacheKey = getPlayableSourceCacheKey(normalized, audioProfile);
+  const cached = cacheGet(DIRECT_CACHE, cacheKey);
   if (cached) return cached;
 
   const tryOnce = async (
@@ -705,7 +761,7 @@ export async function getPlayableSource(
       const source = sourceFromYtDlpJson(JSON.parse(json), attempt.label);
 
       if (source) {
-        cacheSet(DIRECT_CACHE, normalized, source);
+        cacheSet(DIRECT_CACHE, cacheKey, source);
         console.log(
           `[yt-dlp] playable source ${source.debugLabel || ""} ${
             source.formatId || ""
@@ -723,7 +779,10 @@ export async function getPlayableSource(
     }
   };
 
-  for (const attempt of getPlaybackExtractionAttempts(normalized)) {
+  for (const attempt of getPlaybackExtractionAttempts(
+    normalized,
+    audioProfile
+  )) {
     const source = await tryOnce(attempt);
     if (source) return source;
   }
@@ -733,9 +792,10 @@ export async function getPlayableSource(
 
 /** Backward-compatible URL-only accessor for callers that do not load MPV. */
 export async function getDirectPlayableUrl(
-  url: string
+  url: string,
+  audioProfile?: AudioProfileName | null
 ): Promise<string | null> {
-  return (await getPlayableSource(url))?.url || null;
+  return (await getPlayableSource(url, audioProfile))?.url || null;
 }
 
 export const resolvePlayable = getPlayableSource;

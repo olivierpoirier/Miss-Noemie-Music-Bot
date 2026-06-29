@@ -26,6 +26,7 @@ import {
 } from "./ytdlp.js";
 import { MPV_CONFIG, PLAYER_CONFIG } from "./config.js";
 import { isVirtualAudioRoutingReady } from "./utils.js";
+import type { AudioProfileName } from "./audioProfiles.js";
 
 let globalMpvHandle: MpvHandle | null = null;
 let isLooping = false;
@@ -33,8 +34,18 @@ let currentListener: ((ev: MpvEvent) => void) | null = null;
 
 /* ------------------- PRELOAD SYSTEM ------------------- */
 
-let preloaded = new Map<string, PlayableSource>();
-let preloading = new Map<string, Promise<PlayableSource | null>>();
+type PreloadedSource = {
+  audioProfile: AudioProfileName;
+  source: PlayableSource;
+};
+
+type PreloadingSource = {
+  audioProfile: AudioProfileName;
+  task: Promise<PlayableSource | null>;
+};
+
+let preloaded = new Map<string, PreloadedSource>();
+let preloading = new Map<string, PreloadingSource>();
 let preloadWorkerRunning = false;
 
 function computeCurrentPosition(): number {
@@ -89,7 +100,10 @@ function getUpcomingPreloadCandidates(): QueueItem[] {
 
   if (state.control.randomMode) {
     const candidates = queued
-      .filter((item) => !preloaded.has(item.id) && !preloading.has(item.id))
+      .filter(
+        (item) =>
+          !isPreloadedForCurrentProfile(item.id) && !preloading.has(item.id)
+      )
       .sort(() => Math.random() - 0.5);
 
     return candidates.slice(0, preloadLimit);
@@ -97,7 +111,14 @@ function getUpcomingPreloadCandidates(): QueueItem[] {
 
   return queued
     .slice(0, preloadLimit)
-    .filter((item) => !preloaded.has(item.id) && !preloading.has(item.id));
+    .filter(
+      (item) =>
+        !isPreloadedForCurrentProfile(item.id) && !preloading.has(item.id)
+    );
+}
+
+function isPreloadedForCurrentProfile(itemId: string): boolean {
+  return preloaded.get(itemId)?.audioProfile === state.control.audioProfile;
 }
 
 async function resolveItemToSource(
@@ -108,21 +129,28 @@ async function resolveItemToSource(
 
   if (item.url.startsWith("provider:")) return null;
 
-  return getPlayableSource(normalizeUrl(item.url));
+  return getPlayableSource(normalizeUrl(item.url), state.control.audioProfile);
 }
 
 async function preloadTrack(item: QueueItem): Promise<PlayableSource | null> {
   if (!item) return null;
-  if (preloaded.has(item.id)) return preloaded.get(item.id) ?? null;
-  if (preloading.has(item.id)) return preloading.get(item.id) ?? null;
+  const ready = preloaded.get(item.id);
+  if (ready?.audioProfile === state.control.audioProfile) return ready.source;
+  if (ready) preloaded.delete(item.id);
+  const pending = preloading.get(item.id);
+  if (pending?.audioProfile === state.control.audioProfile) {
+    return pending.task;
+  }
+  if (pending) return null;
   if (item.status !== "queued") return null;
 
+  const audioProfile = state.control.audioProfile;
   const task = (async () => {
     try {
       const source = await resolveItemToSource(item);
 
       if (source && item.status === "queued") {
-        preloaded.set(item.id, source);
+        preloaded.set(item.id, { audioProfile, source });
         trimPreloadCache();
         console.log(`[player] ⚡ Préchargé: ${item.title || item.url}`);
       }
@@ -136,7 +164,7 @@ async function preloadTrack(item: QueueItem): Promise<PlayableSource | null> {
     }
   })();
 
-  preloading.set(item.id, task);
+  preloading.set(item.id, { audioProfile, task });
   return task;
 }
 
@@ -169,17 +197,22 @@ async function consumePreloaded(
   item: QueueItem
 ): Promise<PlayableSource | null> {
   const ready = preloaded.get(item.id);
+  if (ready?.audioProfile === state.control.audioProfile) {
+    preloaded.delete(item.id);
+    return ready.source;
+  }
+
   if (ready) {
     preloaded.delete(item.id);
-    return ready;
+    return null;
   }
 
   const pending = preloading.get(item.id);
   if (!pending) return null;
 
-  const out = await pending;
+  const out = await pending.task;
   preloaded.delete(item.id);
-  return out;
+  return pending.audioProfile === state.control.audioProfile ? out : null;
 }
 
 function clearPreloadForItem(itemId: string): void {
@@ -387,14 +420,20 @@ async function resolvePlaybackSource(
   const normalized = normalizeUrl(item.url);
 
   try {
-    const resolved = await resolvePlayable(normalized);
+    const resolved = await resolvePlayable(
+      normalized,
+      state.control.audioProfile
+    );
     if (resolved) return resolved;
   } catch (err) {
     console.warn("[player] resolvePlayable failed, trying fallback", err);
   }
 
   try {
-    const fallback = await getPlayableSource(normalized);
+    const fallback = await getPlayableSource(
+      normalized,
+      state.control.audioProfile
+    );
     if (fallback) return fallback;
   } catch (err) {
     console.warn("[player] getDirectPlayableUrl failed", err);
@@ -448,7 +487,9 @@ function pickNextQueuedItem(): QueueItem | null {
   if (!queued.length) return null;
 
   if (state.control.randomMode) {
-    const ready = queued.filter((item) => preloaded.has(item.id));
+    const ready = queued.filter((item) =>
+      isPreloadedForCurrentProfile(item.id)
+    );
     const pool = ready.length ? ready : queued;
     return pool[Math.floor(Math.random() * pool.length)] ?? null;
   }

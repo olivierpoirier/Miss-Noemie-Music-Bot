@@ -11,9 +11,9 @@ export const DEFAULT_AUDIO_PROFILE: AudioProfileName = "balanced";
 export const AUDIO_PROFILES: Record<AudioProfileName, AudioProfileConfig> = {
   balanced: {
     label: "Équilibré",
-    volume: 90,
+    volume: 87,
     filters:
-      "lavfi=[alimiter=level_in=1:level_out=0.98:limit=0.97:attack=4:release=80]",
+      "lavfi=[highpass=f=35,equalizer=f=220:t=q:w=0.9:g=-1.4,equalizer=f=2600:t=q:w=1.1:g=1.8,equalizer=f=4500:t=q:w=1.3:g=0.8,alimiter=level_in=1:level_out=0.96:limit=0.95:attack=4:release=80]",
   },
   xbox: {
     label: "Xbox",
