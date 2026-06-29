@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Eye, EyeOff, MonitorPlay } from "lucide-react";
 
 import { getVideoEmbed } from "../lib/embed";
+import { IS_VERCEL_DEMO } from "../lib/runtime";
 
 type Props = {
   url?: string | null;
@@ -11,7 +12,10 @@ type Props = {
 const STORAGE_KEY = "xmb_video_preview_enabled";
 
 export default function VideoPreview({ url, rainbow = false }: Props) {
-  const embed = useMemo(() => getVideoEmbed(url), [url]);
+  const embed = useMemo(
+    () => getVideoEmbed(url, { muted: !IS_VERCEL_DEMO }),
+    [url]
+  );
   const [enabled, setEnabled] = useState(false);
 
   useEffect(() => {
@@ -37,12 +41,20 @@ export default function VideoPreview({ url, rainbow = false }: Props) {
   };
 
   return (
-    <section className={`mt-5 overflow-hidden rounded-xl border border-white/10 bg-black/20 ${rainbow ? "rainbow-cycle" : ""}`}>
+    <section
+      className={`mt-5 overflow-hidden rounded-xl border border-white/10 bg-black/20 ${
+        rainbow ? "rainbow-cycle" : ""
+      }`}
+    >
       <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 bg-white/5">
         <div className="flex items-center gap-2 text-sm text-white/80">
           <MonitorPlay size={16} className="text-[var(--c1)]" />
-          <span>Aperçu {embed.label}</span>
-          <span className="text-xs text-white/40">audio du navigateur coupé</span>
+          <span>Apercu {embed.label}</span>
+          <span className="text-xs text-white/40">
+            {IS_VERCEL_DEMO
+              ? "audio sur les haut-parleurs"
+              : "audio du navigateur coupe"}
+          </span>
         </div>
 
         <button
@@ -52,7 +64,7 @@ export default function VideoPreview({ url, rainbow = false }: Props) {
           aria-pressed={enabled}
         >
           {enabled ? <EyeOff size={15} /> : <Eye size={15} />}
-          {enabled ? "Masquer la vidéo" : "Voir la vidéo"}
+          {enabled ? "Masquer la video" : "Voir la video"}
         </button>
       </div>
 
@@ -62,7 +74,7 @@ export default function VideoPreview({ url, rainbow = false }: Props) {
             key={embed.src}
             className="h-full w-full"
             src={embed.src}
-            title={`Aperçu ${embed.label}`}
+            title={`Apercu ${embed.label}`}
             allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
             allowFullScreen
             referrerPolicy="strict-origin-when-cross-origin"

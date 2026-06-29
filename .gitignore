@@ -15,6 +15,7 @@ node_modules
 
 # Ignorer les dossiers de build
 **/dist/
+**/dist-vercel/
 **/build/
 # testing
 /coverage

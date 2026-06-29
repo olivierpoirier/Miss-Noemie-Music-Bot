@@ -4,6 +4,10 @@ export type VideoEmbed = {
   src: string;
 };
 
+type EmbedOptions = {
+  muted?: boolean;
+};
+
 function parseUrl(value: string): URL | null {
   try {
     return new URL(value);
@@ -33,13 +37,13 @@ function youtubeVideoId(url: URL): string | null {
   return null;
 }
 
-function youtubeEmbed(url: URL): VideoEmbed | null {
+function youtubeEmbed(url: URL, muted: boolean): VideoEmbed | null {
   const videoId = youtubeVideoId(url);
   if (!videoId) return null;
 
   const params = new URLSearchParams({
     autoplay: "1",
-    mute: "1",
+    mute: muted ? "1" : "0",
     playsinline: "1",
     rel: "0",
   });
@@ -51,13 +55,17 @@ function youtubeEmbed(url: URL): VideoEmbed | null {
   };
 }
 
-function twitchEmbed(url: URL, parentHost: string): VideoEmbed | null {
+function twitchEmbed(
+  url: URL,
+  parentHost: string,
+  muted: boolean
+): VideoEmbed | null {
   const host = url.hostname.toLowerCase();
   const parts = url.pathname.split("/").filter(Boolean);
   const params = new URLSearchParams({
     parent: parentHost || "localhost",
     autoplay: "true",
-    muted: "true",
+    muted: muted ? "true" : "false",
   });
 
   if (host === "clips.twitch.tv" && parts[0]) {
@@ -78,13 +86,16 @@ function twitchEmbed(url: URL, parentHost: string): VideoEmbed | null {
 }
 
 /**
- * Only official browser players are embedded. They are always muted: the audio
- * heard by players continues to come exclusively from the server-side virtual
- * input, never from the browser.
+ * Only official browser players are embedded. Local mode keeps them muted so
+ * the heard audio comes exclusively from the server-side virtual input.
  */
-export function getVideoEmbed(value?: string | null): VideoEmbed | null {
+export function getVideoEmbed(
+  value?: string | null,
+  options: EmbedOptions = {}
+): VideoEmbed | null {
   if (!value || value.startsWith("provider:")) return null;
 
+  const muted = options.muted ?? true;
   const url = parseUrl(value);
   if (!url) return null;
 
@@ -97,11 +108,11 @@ export function getVideoEmbed(value?: string | null): VideoEmbed | null {
     host === "youtube.com" ||
     host.endsWith(".youtube.com")
   ) {
-    return youtubeEmbed(url);
+    return youtubeEmbed(url, muted);
   }
 
   if (host === "twitch.tv" || host.endsWith(".twitch.tv")) {
-    return twitchEmbed(url, parentHost);
+    return twitchEmbed(url, parentHost, muted);
   }
 
   return null;

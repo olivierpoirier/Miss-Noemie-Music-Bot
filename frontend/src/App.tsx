@@ -11,6 +11,7 @@ import PlayerBar from "./components/PlayerBar";
 import ThemeDock from "./components/ThemeDock";
 import ThemeScene from "./components/ThemeScene";
 import SystemAlert from "./components/SystemAlert";
+import DemoAudioNotice from "./components/DemoAudioNotice";
 
 import SectionCard, { SectionTab } from "./components/SectionCard";
 import HistoryList from "./components/HistoryList";
@@ -18,6 +19,7 @@ import SupportedLinksHelp from "./components/SupportedLinksHelp";
 
 import useLiveQueue from "./hooks/useLiveQueue";
 import { pickUrlLike } from "./lib/api";
+import { IS_VERCEL_DEMO } from "./lib/runtime";
 import {
   type ThemeName,
   type ThemeMode,
@@ -300,6 +302,12 @@ export default function App() {
             clear={() => setToast("")}
             rainbow={rainbow}
           />
+        )}
+
+        {IS_VERCEL_DEMO && (
+          <div className="max-w-7xl mx-auto px-4 md:px-6 pt-6">
+            <DemoAudioNotice theme={theme} rainbow={rainbow} />
+          </div>
         )}
 
         <main className="max-w-7xl mx-auto px-4 md:px-6 py-6">

@@ -2,6 +2,10 @@
   "name": "music-bot",
   "private": true,
   "scripts": {
+    "dev": "node scripts/dev.mjs --tunnel",
+    "dev:local": "node scripts/dev.mjs",
+    "dev:tunnel": "node scripts/dev.mjs --tunnel",
+    "setup": "npm --prefix backend install && npm --prefix frontend install",
     "build:backend": "npm --prefix backend run build",
     "build:frontend": "npm --prefix frontend run build",
     "build:frontend:vercel": "npm --prefix frontend run build:vercel"
