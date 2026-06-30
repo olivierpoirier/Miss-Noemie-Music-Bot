@@ -282,7 +282,7 @@ export default function App() {
         coverUrl={state.now?.thumb ?? null}
       />
 
-      <div className="relative z-10">
+      <div className="relative z-10 min-h-screen flex flex-col">
         <SystemAlert
           isOpen={Boolean(systemError)}
           message={systemError}
@@ -310,7 +310,8 @@ export default function App() {
           </div>
         )}
 
-        <main className="max-w-7xl mx-auto px-4 md:px-6 py-6">
+        <main className="max-w-7xl w-full mx-auto px-4 md:px-6 py-6 flex-1 flex flex-col">
+          <div className="flex-1">
           <div className="mb-4 flex flex-wrap gap-2">
             {collapsed.nowPlaying && (
               <SectionTab
@@ -440,6 +441,8 @@ export default function App() {
               />
               </SectionCard>
             </div>
+          </div>
+
           </div>
 
           <AppFooter rainbow={rainbow} />
