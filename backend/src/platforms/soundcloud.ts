@@ -1,7 +1,25 @@
 export function isSoundCloudUrl(value: string): boolean {
   try {
     const host = new URL(value).hostname.toLowerCase();
-    return host === "soundcloud.com" || host.endsWith(".soundcloud.com");
+    return (
+      host === "soundcloud.com" ||
+      host.endsWith(".soundcloud.com") ||
+      host === "snd.sc" ||
+      host === "soundcloud.app.goo.gl"
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function isSoundCloudShortUrl(value: string): boolean {
+  try {
+    const host = new URL(value).hostname.toLowerCase();
+    return (
+      host === "on.soundcloud.com" ||
+      host === "snd.sc" ||
+      host === "soundcloud.app.goo.gl"
+    );
   } catch {
     return false;
   }

@@ -33,6 +33,8 @@ import {
 } from "./ytdlp.js";
 import {
   isPlaylistUrl,
+  isSoundCloudSetUrl,
+  isSoundCloudShortUrl,
   isSpotifyUrl,
   isYoutubeSearchUrl,
 } from "./platforms/index.js";
@@ -309,9 +311,16 @@ io.on("connection", (socket) => {
 
         const spotify = isSpotifyUrl(normalized);
         const playlist = isPlaylistUrl(normalized);
+        const soundcloudExpandable =
+          isSoundCloudSetUrl(normalized) || isSoundCloudShortUrl(normalized);
 
-        if (spotify || playlist) {
-          socket.emit("toast", "Analyse de la playlist...");
+        if (spotify || playlist || soundcloudExpandable) {
+          socket.emit(
+            "toast",
+            soundcloudExpandable && !playlist
+              ? "Analyse du lien SoundCloud..."
+              : "Analyse de la playlist..."
+          );
 
           const items = await resolveUrlToPlayableItems(normalized);
 
@@ -320,7 +329,7 @@ io.on("connection", (socket) => {
             return;
           }
 
-          const group = `pl_${Date.now()}`;
+          const group = items.length > 1 ? `pl_${Date.now()}` : undefined;
 
           items.forEach((it, index) => {
             pushQueueItem({
@@ -334,7 +343,12 @@ io.on("connection", (socket) => {
             });
           });
 
-          socket.emit("toast", `${items.length} titres ajoutés !`);
+          socket.emit(
+            "toast",
+            items.length > 1
+              ? `${items.length} titres ajoutés !`
+              : "Titre ajouté !"
+          );
           broadcast();
           warmQueueIfPlaying();
           void ensurePlayerLoop(broadcast);

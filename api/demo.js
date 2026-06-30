@@ -16,7 +16,10 @@ const PLAYLIST_HINTS = [
   "collection",
 ];
 
-const DEMO_PLAYLIST_ITEM_COUNT = 3;
+const DEMO_PLAYLIST_MAX_ITEMS = 50;
+const DEMO_FETCH_TIMEOUT_MS = 5500;
+const RECENT_REQUEST_LIMIT = 80;
+const RECENT_ADD_WINDOW_MS = 3500;
 
 function createStore() {
   return {
@@ -25,6 +28,10 @@ function createStore() {
     now: null,
     queue: [],
     history: [],
+    handledClientRequests: [],
+    pendingClientRequests: [],
+    pendingAdds: [],
+    recentAdds: [],
   };
 }
 
@@ -123,73 +130,377 @@ function playlistSourceLabel(url) {
   return "Playlist";
 }
 
-function playlistDemoUrl(raw, index) {
+function cleanText(value) {
+  return String(value || "")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function textFromRichText(value) {
+  if (!value) return "";
+  if (typeof value === "string") return cleanText(value);
+  if (value.simpleText) return cleanText(value.simpleText);
+
+  if (Array.isArray(value.runs)) {
+    return cleanText(value.runs.map((run) => run?.text || "").join(""));
+  }
+
+  return cleanText(value.accessibility?.accessibilityData?.label || "");
+}
+
+function parseDurationSec(value) {
+  const text = String(value || "").trim();
+  if (!/^\d+(?::\d+){1,2}$/.test(text)) return 0;
+
+  return text
+    .split(":")
+    .map((part) => Number(part) || 0)
+    .reduce((total, part) => total * 60 + part, 0);
+}
+
+function youtubeThumbnail(videoId) {
+  return videoId ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg` : null;
+}
+
+function bestThumbnailUrl(thumbnails) {
+  if (!Array.isArray(thumbnails) || !thumbnails.length) return null;
+
+  const sorted = [...thumbnails].sort((a, b) => {
+    const aSize = (a?.width || 0) * (a?.height || 0);
+    const bSize = (b?.width || 0) * (b?.height || 0);
+    return bSize - aSize;
+  });
+  const url = sorted[0]?.url;
+
+  if (!url) return null;
+  if (url.startsWith("//")) return `https:${url}`;
+  return cleanText(url);
+}
+
+function playlistIdFromUrl(url) {
+  const host = url.hostname.replace(/^www\./, "");
+
+  if (!host.includes("youtube.com") && host !== "youtu.be") {
+    return null;
+  }
+
+  return url.searchParams.get("list");
+}
+
+function youtubePlaylistItemUrl(videoId, playlistId) {
+  const url = new URL("https://www.youtube.com/watch");
+  url.searchParams.set("v", videoId);
+  url.searchParams.set("list", playlistId);
+  return url.toString();
+}
+
+async function fetchWithTimeout(url, options = {}) {
+  if (typeof fetch !== "function") {
+    throw new Error("fetch unavailable");
+  }
+
+  const controller =
+    typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timeoutId = controller
+    ? setTimeout(() => controller.abort(), DEMO_FETCH_TIMEOUT_MS)
+    : null;
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller?.signal,
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (compatible; MusicBotDemo/1.0; +https://vercel.app)",
+        accept: "text/html,application/json;q=0.9,*/*;q=0.8",
+        ...(options.headers || {}),
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`fetch failed with ${response.status}`);
+    }
+
+    return response;
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+async function fetchJson(url) {
+  const response = await fetchWithTimeout(url, {
+    headers: { accept: "application/json" },
+  });
+  return response.json();
+}
+
+async function fetchText(url) {
+  const response = await fetchWithTimeout(url);
+  return response.text();
+}
+
+function extractJsonObjectAfter(html, marker) {
+  const markerIndex = html.indexOf(marker);
+  if (markerIndex === -1) return null;
+
+  const start = html.indexOf("{", markerIndex);
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = start; index < html.length; index += 1) {
+    const char = html[index];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+    } else if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return html.slice(start, index + 1);
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractYtInitialData(html) {
+  const markers = [
+    "var ytInitialData =",
+    "window[\"ytInitialData\"] =",
+    "ytInitialData =",
+  ];
+
+  for (const marker of markers) {
+    const jsonText = extractJsonObjectAfter(html, marker);
+    if (!jsonText) continue;
+
+    try {
+      return JSON.parse(jsonText);
+    } catch {
+      // Try the next marker.
+    }
+  }
+
+  return null;
+}
+
+function collectPlaylistRenderers(node, output = []) {
+  if (!node || output.length >= DEMO_PLAYLIST_MAX_ITEMS) {
+    return output;
+  }
+
+  if (Array.isArray(node)) {
+    for (const entry of node) {
+      collectPlaylistRenderers(entry, output);
+      if (output.length >= DEMO_PLAYLIST_MAX_ITEMS) break;
+    }
+    return output;
+  }
+
+  if (typeof node !== "object") {
+    return output;
+  }
+
+  const renderer = node.playlistVideoRenderer || node.playlistPanelVideoRenderer;
+  if (renderer?.videoId && renderer?.title) {
+    output.push(renderer);
+  }
+
+  for (const value of Object.values(node)) {
+    collectPlaylistRenderers(value, output);
+    if (output.length >= DEMO_PLAYLIST_MAX_ITEMS) break;
+  }
+
+  return output;
+}
+
+function mapYoutubeRenderer(renderer, playlistId) {
+  const videoId = renderer.videoId;
+  const title = textFromRichText(renderer.title);
+
+  if (
+    !videoId ||
+    !title ||
+    /^(deleted video|private video|unavailable)$/i.test(title)
+  ) {
+    return null;
+  }
+
+  const durationText = textFromRichText(renderer.lengthText);
+
+  return {
+    url: youtubePlaylistItemUrl(videoId, playlistId),
+    title,
+    thumb: bestThumbnailUrl(renderer.thumbnail?.thumbnails) || youtubeThumbnail(videoId),
+    durationSec: parseDurationSec(durationText),
+  };
+}
+
+async function resolveYoutubePlaylist(raw, playlistId) {
+  const url = `https://www.youtube.com/playlist?list=${encodeURIComponent(
+    playlistId
+  )}&hl=fr&gl=CA`;
+  const html = await fetchText(url);
+  const initialData = extractYtInitialData(html);
+  const renderers = collectPlaylistRenderers(initialData);
+  const seen = new Set();
+  const items = [];
+
+  for (const renderer of renderers) {
+    const item = mapYoutubeRenderer(renderer, playlistId);
+    if (!item || seen.has(item.url)) continue;
+
+    seen.add(item.url);
+    items.push(item);
+
+    if (items.length >= DEMO_PLAYLIST_MAX_ITEMS) {
+      break;
+    }
+  }
+
+  if (!items.length) {
+    throw new Error(`No playlist entries found for ${raw}`);
+  }
+
+  return items;
+}
+
+function oEmbedEndpointsForUrl(url) {
+  const host = url.hostname.replace(/^www\./, "");
+  const encoded = encodeURIComponent(url.toString());
+  const noembed = `https://noembed.com/embed?url=${encoded}`;
+
+  if (host.includes("youtube.com") || host === "youtu.be") {
+    return [
+      `https://www.youtube.com/oembed?url=${encoded}&format=json`,
+      noembed,
+    ];
+  }
+
+  if (host.includes("spotify.com")) {
+    return [`https://open.spotify.com/oembed?url=${encoded}`, noembed];
+  }
+
+  if (host.includes("soundcloud.com")) {
+    return [
+      `https://soundcloud.com/oembed?format=json&url=${encoded}`,
+      noembed,
+    ];
+  }
+
+  return [noembed];
+}
+
+async function resolveOEmbed(url) {
+  for (const endpoint of oEmbedEndpointsForUrl(url)) {
+    try {
+      const data = await fetchJson(endpoint);
+      const title = cleanText(data?.title);
+
+      if (!title) {
+        continue;
+      }
+
+      return {
+        title,
+        thumb: cleanText(data?.thumbnail_url) || null,
+      };
+    } catch {
+      // Try the next public metadata endpoint.
+    }
+  }
+
+  return null;
+}
+
+async function resolveSingleDemoItem(raw) {
   const normalized = normalizeInput(raw);
   const parsed = safeUrl(normalized);
-
-  if (!parsed) {
-    return normalized;
-  }
-
-  const host = parsed.hostname.replace(/^www\./, "");
-  const listId = parsed.searchParams.get("list");
-
-  if ((host.includes("youtube.com") || host === "youtu.be") && listId) {
-    parsed.hostname = "www.youtube.com";
-    parsed.pathname = "/playlist";
-    parsed.search = `?list=${encodeURIComponent(listId)}`;
-  }
-
-  parsed.hash = `demo-track-${index + 1}`;
-  return parsed.toString();
-}
-
-function playlistDemoTitle(raw, index) {
-  const parsed = safeUrl(normalizeInput(raw));
-  const source = playlistSourceLabel(parsed);
-  return `${source} - piste ${index + 1} (demo sans audio)`;
-}
-
-function buildDemoItem(raw, addedBy, clientRequestId, index = 0, playlist = false) {
-  const normalized = playlist ? playlistDemoUrl(raw, index) : normalizeInput(raw);
-  const parsed = safeUrl(normalized);
-  const idSeed = `${normalized}:${index}`;
+  const idSeed = `${normalized}:single`;
   const durationSec = 130 + (hashString(idSeed) % 210);
 
   if (!parsed) {
     return {
-      id: "",
       url: normalized,
-      title: playlist ? playlistDemoTitle(raw, index) : String(raw || "Signal demo"),
+      title: cleanText(raw) || "Signal demo",
       thumb: null,
-      addedBy,
-      status: "queued",
-      createdAt: Date.now(),
       durationSec,
-      clientRequestId,
     };
   }
 
   const videoId = youtubeId(parsed);
-  const baseTitle = titleFromUrl(parsed, parsed.hostname);
-  const title = playlist ? playlistDemoTitle(raw, index) : baseTitle;
+  const metadata = await resolveOEmbed(parsed);
+  const fallbackTitle = titleFromUrl(parsed, parsed.hostname);
 
   return {
-    id: "",
     url: normalized,
-    title,
-    thumb: !playlist && videoId ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg` : null,
-    addedBy,
-    status: "queued",
-    createdAt: Date.now(),
+    title: metadata?.title || fallbackTitle,
+    thumb: metadata?.thumb || youtubeThumbnail(videoId),
     durationSec,
-    clientRequestId: index === 0 ? clientRequestId : undefined,
   };
 }
 
 function looksLikePlaylist(raw) {
   const value = String(raw || "").toLowerCase();
   return PLAYLIST_HINTS.some((hint) => value.includes(hint));
+}
+
+async function resolveDemoItems(raw) {
+  const normalized = normalizeInput(raw);
+  const parsed = safeUrl(normalized);
+  const playlistId = parsed ? playlistIdFromUrl(parsed) : null;
+
+  if (playlistId) {
+    try {
+      return await resolveYoutubePlaylist(raw, playlistId);
+    } catch {
+      // Keep the demo useful even when YouTube blocks metadata scraping.
+    }
+  }
+
+  const singleItem = await resolveSingleDemoItem(raw);
+
+  if (looksLikePlaylist(raw) && parsed) {
+    singleItem.title = singleItem.title || playlistSourceLabel(parsed);
+  }
+
+  return [singleItem];
+}
+
+function buildQueueItem(resolved, addedBy, clientRequestId, index, group) {
+  return {
+    id: "",
+    url: resolved.url,
+    title: resolved.title || resolved.url,
+    thumb: resolved.thumb || null,
+    addedBy,
+    group,
+    status: "queued",
+    createdAt: Date.now(),
+    durationSec: resolved.durationSec || 0,
+    clientRequestId: index === 0 ? clientRequestId : undefined,
+  };
 }
 
 function computePosition(store) {
@@ -279,24 +590,161 @@ function statePayload(store) {
   };
 }
 
-function addQueueItems(store, raw, addedBy, clientRequestId) {
-  const playlist = looksLikePlaylist(raw);
-  const count = playlist ? DEMO_PLAYLIST_ITEM_COUNT : 1;
-  const created = [];
+function ensureRequestTracking(store) {
+  store.handledClientRequests = Array.isArray(store.handledClientRequests)
+    ? store.handledClientRequests
+    : [];
+  store.pendingClientRequests = Array.isArray(store.pendingClientRequests)
+    ? store.pendingClientRequests
+    : [];
+  store.pendingAdds = Array.isArray(store.pendingAdds) ? store.pendingAdds : [];
+  store.recentAdds = Array.isArray(store.recentAdds) ? store.recentAdds : [];
+}
 
-  for (let index = 0; index < count; index += 1) {
-    const item = buildDemoItem(raw, addedBy, clientRequestId, index, playlist);
-    item.id = String(store.nextId);
-    store.nextId += 1;
-    created.push(item);
+function rememberLimited(list, value) {
+  list.push(value);
+
+  while (list.length > RECENT_REQUEST_LIMIT) {
+    list.shift();
+  }
+}
+
+function clientRequestKey(value) {
+  return String(value || "").trim().slice(0, 120);
+}
+
+function isDuplicateClientRequest(store, clientRequestId) {
+  const key = clientRequestKey(clientRequestId);
+  if (!key) return false;
+
+  ensureRequestTracking(store);
+
+  return (
+    store.handledClientRequests.includes(key) ||
+    store.pendingClientRequests.includes(key)
+  );
+}
+
+function markClientRequestPending(store, clientRequestId) {
+  const key = clientRequestKey(clientRequestId);
+  if (!key) return "";
+
+  ensureRequestTracking(store);
+  rememberLimited(store.pendingClientRequests, key);
+  return key;
+}
+
+function markClientRequestHandled(store, key) {
+  if (!key) return;
+
+  ensureRequestTracking(store);
+  store.pendingClientRequests = store.pendingClientRequests.filter(
+    (item) => item !== key
+  );
+  rememberLimited(store.handledClientRequests, key);
+}
+
+function clearPendingClientRequest(store, key) {
+  if (!key) return;
+
+  ensureRequestTracking(store);
+  store.pendingClientRequests = store.pendingClientRequests.filter(
+    (item) => item !== key
+  );
+}
+
+function recentAddKey(raw, addedBy) {
+  return `${String(addedBy || "").toLowerCase()}:${normalizeInput(raw).toLowerCase()}`;
+}
+
+function pruneRecentAdds(store) {
+  const cutoff = Date.now() - RECENT_ADD_WINDOW_MS;
+  store.recentAdds = store.recentAdds.filter((entry) => entry.createdAt >= cutoff);
+}
+
+function wasRecentlyAdded(store, raw, addedBy) {
+  ensureRequestTracking(store);
+  pruneRecentAdds(store);
+
+  const key = recentAddKey(raw, addedBy);
+  return (
+    store.pendingAdds.includes(key) ||
+    store.recentAdds.some((entry) => entry.key === key)
+  );
+}
+
+function rememberRecentAdd(store, raw, addedBy) {
+  ensureRequestTracking(store);
+  pruneRecentAdds(store);
+  store.recentAdds.push({ key: recentAddKey(raw, addedBy), createdAt: Date.now() });
+}
+
+function markAddPending(store, raw, addedBy) {
+  ensureRequestTracking(store);
+  const key = recentAddKey(raw, addedBy);
+  rememberLimited(store.pendingAdds, key);
+  return key;
+}
+
+function clearPendingAdd(store, key) {
+  if (!key) return;
+
+  ensureRequestTracking(store);
+  store.pendingAdds = store.pendingAdds.filter((item) => item !== key);
+}
+
+async function addQueueItems(store, raw, addedBy, clientRequestId) {
+  if (isDuplicateClientRequest(store, clientRequestId)) {
+    return { count: 0, duplicate: true };
   }
 
-  if (!store.now) {
-    startItem(store, created.shift());
+  if (wasRecentlyAdded(store, raw, addedBy)) {
+    return { count: 0, duplicate: true };
   }
 
-  store.queue.push(...created);
-  return count;
+  const requestKey = markClientRequestPending(store, clientRequestId);
+  const addKey = markAddPending(store, raw, addedBy);
+
+  try {
+    const resolvedItems = await resolveDemoItems(raw);
+    const group =
+      resolvedItems.length > 1
+        ? `demo_${Date.now()}_${hashString(String(raw || ""))}`
+        : undefined;
+    const created = resolvedItems.map((resolved, index) => {
+      const item = buildQueueItem(
+        resolved,
+        addedBy,
+        clientRequestId,
+        index,
+        group
+      );
+      item.id = String(store.nextId);
+      store.nextId += 1;
+      return item;
+    });
+    const count = created.length;
+
+    if (!count) {
+      clearPendingAdd(store, addKey);
+      clearPendingClientRequest(store, requestKey);
+      return { count: 0, duplicate: false };
+    }
+
+    if (!store.now) {
+      startItem(store, created.shift());
+    }
+
+    store.queue.push(...created);
+    rememberRecentAdd(store, raw, addedBy);
+    clearPendingAdd(store, addKey);
+    markClientRequestHandled(store, requestKey);
+    return { count, duplicate: false };
+  } catch (error) {
+    clearPendingAdd(store, addKey);
+    clearPendingClientRequest(store, requestKey);
+    throw error;
+  }
 }
 
 function shuffle(items) {
@@ -480,12 +928,18 @@ async function handler(req, res) {
           break;
         }
 
-        const count = addQueueItems(
+        const result = await addQueueItems(
           store,
           raw,
           String(body.addedBy || "anon").slice(0, 32),
           String(body.clientRequestId || "")
         );
+        if (result.duplicate) {
+          toast = "Ajout deja traite.";
+          break;
+        }
+
+        const count = result.count;
         toast = count > 1 ? `${count} titres ajoutés !` : "Titre ajouté !";
         break;
       }

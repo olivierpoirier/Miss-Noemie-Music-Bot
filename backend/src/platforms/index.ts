@@ -1,5 +1,9 @@
 import { isDirectMediaUrl } from "./direct.js";
-import { isSoundCloudSetUrl, isSoundCloudUrl } from "./soundcloud.js";
+import {
+  isSoundCloudSetUrl,
+  isSoundCloudShortUrl,
+  isSoundCloudUrl,
+} from "./soundcloud.js";
 import { isSpotifyUrl } from "./spotify.js";
 import { isTwitchUrl, normalizeTwitchUrl } from "./twitch.js";
 import {
@@ -43,6 +47,7 @@ export function isPlaylistUrl(value: string): boolean {
 export {
   isDirectMediaUrl,
   isSoundCloudSetUrl,
+  isSoundCloudShortUrl,
   isSoundCloudUrl,
   isSpotifyUrl,
   isTwitchUrl,

@@ -70,6 +70,7 @@ export default function useVercelDemoQueue() {
   const [systemError, setSystemError] = useState<string | null>(null);
   const [busy, setBusyState] = useState<BusyState>(null);
   const busyTimerRef = useRef<number | null>(null);
+  const playInFlightRef = useRef(false);
 
   const clearBusy = useCallback(() => {
     setBusyState(null);
@@ -167,6 +168,11 @@ export default function useVercelDemoQueue() {
 
   const play = useCallback(
     (url: string, addedBy?: string) => {
+      if (playInFlightRef.current) {
+        return;
+      }
+
+      playInFlightRef.current = true;
       void runAction(
         "play",
         {
@@ -175,7 +181,9 @@ export default function useVercelDemoQueue() {
           clientRequestId: makeClientRequestId(),
         },
         "play"
-      );
+      ).finally(() => {
+        playInFlightRef.current = false;
+      });
     },
     [runAction]
   );

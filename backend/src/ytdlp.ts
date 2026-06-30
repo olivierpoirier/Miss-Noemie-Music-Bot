@@ -8,6 +8,7 @@ import {
   getMediaPlatform,
   isDirectMediaUrl,
   isPlaylistUrl,
+  isSoundCloudUrl,
   isSpotifyUrl,
   isYoutubeSearchUrl,
   isYoutubeUrl,
@@ -188,9 +189,69 @@ function pickBestThumbnail(data: any, title?: string, url?: string): string {
   return direct || buildFallbackThumb(title, url);
 }
 
+function cleanText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+
+  const trimmed = value.replace(/\s+/g, " ").trim();
+  if (!trimmed) return null;
+
+  const lowered = trimmed.toLowerCase();
+  if (lowered === "unknown" || lowered === "null" || lowered === "undefined") {
+    return null;
+  }
+
+  return trimmed;
+}
+
+function titleFromUrl(value?: string | null): string | null {
+  if (!value) return null;
+
+  try {
+    const url = new URL(value);
+    const parts = url.pathname.split("/").filter(Boolean);
+    const last = parts[parts.length - 1];
+    if (!last || last === "sets") return null;
+
+    const decoded = decodeURIComponent(last)
+      .replace(/\.[a-z0-9]{2,5}$/i, "")
+      .replace(/[-_]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    return decoded || null;
+  } catch {
+    return null;
+  }
+}
+
+function pickEntryTitle(
+  entry: any,
+  entryUrl: string | null,
+  playlistUrl: string
+): string {
+  const explicit =
+    cleanText(entry?.title) ||
+    cleanText(entry?.track) ||
+    cleanText(entry?.fulltitle) ||
+    cleanText(entry?.alt_title) ||
+    cleanText(entry?.display_id);
+
+  if (explicit) return explicit;
+
+  const urlTitle = titleFromUrl(entryUrl) || titleFromUrl(playlistUrl);
+  const artist =
+    cleanText(entry?.uploader) ||
+    cleanText(entry?.artist) ||
+    cleanText(entry?.creator);
+
+  if (artist && urlTitle) return `${artist} - ${urlTitle}`;
+  return urlTitle || artist || getSourceLabel(entryUrl || playlistUrl);
+}
+
 function buildEntryUrl(entry: any, playlistUrl: string): string | null {
   const raw =
     entry?.webpage_url ||
+    entry?.permalink_url ||
     entry?.original_url ||
     entry?.url ||
     entry?.webpage_url_basename ||
@@ -198,6 +259,14 @@ function buildEntryUrl(entry: any, playlistUrl: string): string | null {
 
   if (typeof raw === "string" && /^https?:\/\//i.test(raw)) {
     return normalizeUrl(raw);
+  }
+
+  if (typeof raw === "string" && /^\/[^/]/.test(raw)) {
+    return normalizeUrl(new URL(raw, "https://soundcloud.com").toString());
+  }
+
+  if (typeof raw === "string" && /^soundcloud\.com\//i.test(raw)) {
+    return normalizeUrl(`https://${raw}`);
   }
 
   if (entry?.id && isYoutubeUrl(playlistUrl)) {
@@ -211,12 +280,7 @@ function mapEntryToResolvedItem(entry: any, playlistUrl: string): ResolvedItem |
   const entryUrl = buildEntryUrl(entry, playlistUrl);
   if (!entryUrl) return null;
 
-  const title =
-    entry?.title ||
-    entry?.track ||
-    entry?.fulltitle ||
-    entry?.uploader ||
-    "Unknown";
+  const title = pickEntryTitle(entry, entryUrl, playlistUrl);
 
   return {
     url: entryUrl,
@@ -224,6 +288,66 @@ function mapEntryToResolvedItem(entry: any, playlistUrl: string): ResolvedItem |
     thumb: pickBestThumbnail(entry, title, entryUrl),
     durationSec: Number(entry?.duration) || 0,
   };
+}
+
+function mapEntriesToResolvedItems(
+  data: any,
+  playlistUrl: string
+): ResolvedItem[] {
+  if (!Array.isArray(data?.entries)) return [];
+
+  return data.entries
+    .map((entry: any) => mapEntryToResolvedItem(entry, playlistUrl))
+    .filter(Boolean)
+    .slice(0, 200) as ResolvedItem[];
+}
+
+function mapSingleDataToResolvedItem(data: any, url: string): ResolvedItem {
+  const normalized = buildEntryUrl(data, url) || normalizeUrl(url);
+  const title = pickEntryTitle(data, normalized, url);
+
+  return {
+    url: normalized,
+    title,
+    thumb: pickBestThumbnail(data, title, normalized),
+    durationSec: Number(data?.duration) || 0,
+  };
+}
+
+async function resolveSoundCloudItems(
+  normalized: string
+): Promise<ResolvedItem[] | null> {
+  if (!isSoundCloudUrl(normalized)) return null;
+
+  try {
+    const json = await runYtDlp(
+      normalized,
+      [
+        "-J",
+        "--yes-playlist",
+        "--flat-playlist",
+        "--playlist-end",
+        "200",
+        normalized,
+      ],
+      { useCookies: false }
+    );
+
+    const data = JSON.parse(json);
+    const items = mapEntriesToResolvedItems(data, normalized);
+
+    if (Array.isArray(data?.entries)) {
+      return items.map((it) => ({
+        ...it,
+        thumb: it.thumb || buildFallbackThumb(it.title, it.url),
+      }));
+    }
+
+    return [mapSingleDataToResolvedItem(data, normalized)];
+  } catch (err) {
+    console.warn("[soundcloud resolve error]", err);
+    return null;
+  }
 }
 
 async function resolveYoutubePlaylistFast(
@@ -388,6 +512,12 @@ export async function resolveUrlToPlayableItems(
     return [];
   }
 
+  const soundCloudItems = await resolveSoundCloudItems(normalized);
+  if (soundCloudItems?.length) {
+    cacheSet(FLAT_CACHE, normalized, soundCloudItems);
+    return soundCloudItems;
+  }
+
   if (isPlaylistUrl(normalized)) {
     const fastYoutubePlaylist = await resolveYoutubePlaylistFast(normalized);
     if (fastYoutubePlaylist) {
@@ -411,12 +541,9 @@ export async function resolveUrlToPlayableItems(
 
       const data = JSON.parse(json);
 
-      if (Array.isArray(data?.entries)) {
-        const items = data.entries
-          .map((entry: any) => mapEntryToResolvedItem(entry, normalized))
-          .filter(Boolean)
-          .slice(0, 200) as ResolvedItem[];
+      const items = mapEntriesToResolvedItems(data, normalized);
 
+      if (items.length) {
         const hydrated = items.map((it) => ({
           ...it,
           thumb: it.thumb || buildFallbackThumb(it.title, it.url),
@@ -513,16 +640,12 @@ export async function probeSingle(url: string): Promise<ProbeResult> {
 
     const data = JSON.parse(json);
 
-    const title =
-      data?.title ||
-      data?.track ||
-      data?.fulltitle ||
-      data?.uploader ||
-      getSourceLabel(normalized);
+    const dataUrl = buildEntryUrl(data, normalized) || normalized;
+    const title = pickEntryTitle(data, dataUrl, normalized);
 
     const res: ProbeResult = {
       title,
-      thumb: pickBestThumbnail(data, title, normalized),
+      thumb: pickBestThumbnail(data, title, dataUrl),
       durationSec: Number(data?.duration) || 0,
     };
 
