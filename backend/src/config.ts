@@ -1,5 +1,6 @@
 import path from "path";
 import fs from "fs";
+import { fileURLToPath } from "node:url";
 import { normalizeAudioProfileName } from "./audioProfiles.js";
 
 const PLATFORM = process.platform;
@@ -29,10 +30,26 @@ function envNumber(key: string, fallback: number): number {
 }
 
 export const APP_CONFIG = {
-  PORT: 4000,
+  PORT: Math.min(65535, Math.floor(envNumber("PORT", 4000))),
+  // Keep playback alive when browsers sleep or the tunnel reconnects.
+  idleShutdownMs: Math.min(
+    2_147_483_647,
+    Math.floor(envNumber("IDLE_SHUTDOWN_MS", 0))
+  ),
   platform: PLATFORM,
   isWindows: IS_WINDOWS,
   isLinux: IS_LINUX,
+};
+
+export const DIAGNOSTICS_CONFIG = {
+  enabled: envEnabled("DIAGNOSTICS_ENABLED", !process.env.NODE_TEST_CONTEXT),
+  directory: envOrDefault(
+    "DIAGNOSTICS_LOG_DIR",
+    fileURLToPath(new URL("../../.data/logs/", import.meta.url))
+  ),
+  maxBytes: Math.max(16_384, Math.min(envNumber("DIAGNOSTICS_MAX_BYTES", 1_048_576), 10_485_760)),
+  maxFiles: 3,
+  maxEvents: 100,
 };
 
 function findCookiesPath(): string | null {

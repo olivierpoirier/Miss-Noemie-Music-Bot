@@ -1,4 +1,4 @@
-import { AnimatePresence, motion } from "framer-motion";
+import { AnimatePresence, motion } from "motion/react";
 import {
   Play,
   Pause,
@@ -20,6 +20,11 @@ import { useState, useEffect, useRef } from "react";
 import type { Now, Command, AudioProfileName } from "../types";
 import type { ThemeName } from "../lib/themes";
 import SpectrumBars from "./SpectrumBars";
+import {
+  playbackPosition,
+  clampPlaybackPosition,
+  formatPlaybackTime as formatTime,
+} from "../../../shared/playback.js";
 
 interface Props {
   now: Now | null;
@@ -31,16 +36,6 @@ interface Props {
   sendCommand: (cmd: Command, arg?: number | string) => void;
   rainbow?: boolean;
   theme: ThemeName;
-}
-
-function formatTime(sec: number): string {
-  const s = Math.max(0, Math.floor(sec));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const ss = s % 60;
-  return h > 0
-    ? `${h}:${String(m).padStart(2, "0")}:${String(ss).padStart(2, "0")}`
-    : `${m}:${String(ss).padStart(2, "0")}`;
 }
 
 export default function PlayerBar({
@@ -65,14 +60,7 @@ export default function PlayerBar({
       const nowMs = Date.now();
 
       if (!isDragging && nowMs - lastSeekTime.current > 800) {
-        if (!now) {
-          setLocalPos(0);
-        } else if (now.isBuffering || paused || !now.startedAt) {
-          setLocalPos(now.positionOffsetSec || 0);
-        } else {
-          const elapsed = (nowMs - now.startedAt) / 1000;
-          setLocalPos(elapsed);
-        }
+        setLocalPos(playbackPosition(now, paused, nowMs));
       }
     };
 
@@ -86,15 +74,16 @@ export default function PlayerBar({
   }, [now, paused, isDragging]);
 
   const handleSeekEnd = (value: number) => {
+    const position = clampPlaybackPosition(value, now?.durationSec);
     setIsDragging(false);
-    setLocalPos(value);
+    setLocalPos(position);
     lastSeekTime.current = Date.now();
-    sendCommand("seek_abs", value);
+    sendCommand("seek_abs", position);
   };
 
   const isBuffering = Boolean(now?.isBuffering);
   const isBusy = Boolean(busy) || isBuffering;
-  const hasDur = !!now?.durationSec && now.durationSec > 0;
+  const hasDur = Number.isFinite(now?.durationSec) && (now?.durationSec ?? 0) > 0;
   const dur = hasDur ? now!.durationSec! : 0;
 
   const hasRealTitle =
@@ -111,11 +100,7 @@ export default function PlayerBar({
 
   const subtitle = now?.addedBy ? `Ajouté par ${now.addedBy}` : "Source web";
 
-  const currentPos = isDragging
-    ? dragValue
-    : hasDur
-    ? Math.min(dur, Math.max(0, localPos))
-    : localPos;
+  const currentPos = clampPlaybackPosition(isDragging ? dragValue : localPos, dur);
 
   const progressPct = hasDur ? (currentPos / dur) * 100 : 0;
 
@@ -363,12 +348,17 @@ export default function PlayerBar({
                               max={Math.max(1, Math.floor(dur))}
                               value={Math.floor(currentPos)}
                               disabled={!hasDur}
-                              onMouseDown={() => setIsDragging(true)}
-                              onMouseUp={(e) =>
-                                handleSeekEnd(
-                                  parseInt((e.target as HTMLInputElement).value, 10)
-                                )
-                              }
+                              onPointerDown={(e) => {
+                                e.currentTarget.setPointerCapture(e.pointerId);
+                                setIsDragging(true);
+                              }}
+                              onPointerUp={(e) => handleSeekEnd(Number(e.currentTarget.value))}
+                              onPointerCancel={() => setIsDragging(false)}
+                              onKeyUp={(e) => {
+                                if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(e.key)) {
+                                  handleSeekEnd(Number(e.currentTarget.value));
+                                }
+                              }}
                               onChange={(e) => {
                                 const val = parseInt(e.target.value, 10);
                                 setDragValue(val);

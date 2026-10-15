@@ -12,11 +12,15 @@ export default function Toast({ message, clear, rainbow }: Props) {
   useEffect(() => {
     if (message) {
       setVisible(true);
+      let clearTimer: ReturnType<typeof setTimeout> | undefined;
       const timer = setTimeout(() => {
         setVisible(false);
-        setTimeout(clear, 300);
+        clearTimer = setTimeout(clear, 300);
       }, 4000);
-      return () => clearTimeout(timer);
+      return () => {
+        clearTimeout(timer);
+        clearTimeout(clearTimer);
+      };
     }
   }, [message, clear]);
 

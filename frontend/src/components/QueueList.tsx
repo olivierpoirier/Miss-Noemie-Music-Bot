@@ -4,6 +4,7 @@ import {
   closestCenter,
   PointerSensor,
   TouchSensor,
+  KeyboardSensor,
   useSensor,
   useSensors,
 } from "@dnd-kit/core";
@@ -13,6 +14,7 @@ import {
   useSortable,
   verticalListSortingStrategy,
   arrayMove,
+  sortableKeyboardCoordinates,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { Trash2, GripVertical, ListMusic, Shuffle } from "lucide-react";
@@ -62,7 +64,7 @@ function SortableQueueItem({
     transform,
     transition,
     isDragging,
-  } = useSortable({ id: item.id });
+  } = useSortable({ id: item.id, disabled: disabled || item.status === "pending" });
 
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
@@ -96,11 +98,15 @@ function SortableQueueItem({
         }}
         onDrop={(e) => {
           const raw = e.dataTransfer.getData("application/x-xmb-history-item");
-          if (!raw) return;
+          if (!raw || disabled || isPending) return;
+          e.preventDefault();
+          e.stopPropagation();
 
           try {
-            const data = JSON.parse(raw) as { id: string };
-            onDropHistoryItem?.(data.id, index);
+            const data: unknown = JSON.parse(raw);
+            if (data && typeof data === "object" && "id" in data && typeof data.id === "string") {
+              onDropHistoryItem?.(data.id, index);
+            }
           } catch (err) {
             console.warn("Drop history item invalide", err);
           }
@@ -112,8 +118,6 @@ function SortableQueueItem({
           {...attributes}
           {...listeners}
           disabled={disabled || isPending}
-          onPointerDown={(e) => e.stopPropagation()}
-          onTouchStart={(e) => e.stopPropagation()}
           className={cn(
             "cursor-grab active:cursor-grabbing text-muted hover:text-white shrink-0 touch-none",
             rainbow && "rainbow-cycle"
@@ -218,6 +222,7 @@ export default function QueueList({
   const isAdventurer = !rainbow && theme === "adventurer";
 
   const sensors = useSensors(
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
     useSensor(PointerSensor, {
       activationConstraint: { distance: 10 },
     }),
@@ -231,13 +236,14 @@ export default function QueueList({
 
   const handleDragEnd = (event: DragEndEvent) => {
     const { active, over } = event;
-    if (!over || active.id === over.id) return;
+    if (isBusy || !over || active.id === over.id) return;
 
-    const oldIndex = queue.findIndex((q) => q.id === active.id);
-    const newIndex = queue.findIndex((q) => q.id === over.id);
+    const queuedItems = queue.filter((q) => q.status !== "pending");
+    const oldIndex = queuedItems.findIndex((q) => q.id === active.id);
+    const newIndex = queuedItems.findIndex((q) => q.id === over.id);
     if (oldIndex < 0 || newIndex < 0) return;
 
-    const newOrder = arrayMove(queue, oldIndex, newIndex);
+    const newOrder = arrayMove(queuedItems, oldIndex, newIndex);
     onReorder(newOrder.map((q) => q.id));
   };
 
@@ -255,11 +261,15 @@ export default function QueueList({
         }}
         onDrop={(e) => {
           const raw = e.dataTransfer.getData("application/x-xmb-history-item");
-          if (!raw) return;
+          if (!raw || isBusy) return;
+          e.preventDefault();
+          e.stopPropagation();
 
           try {
-            const data = JSON.parse(raw) as { id: string };
-            onDropHistoryItem?.(data.id, queue.length);
+            const data: unknown = JSON.parse(raw);
+            if (data && typeof data === "object" && "id" in data && typeof data.id === "string") {
+              onDropHistoryItem?.(data.id);
+            }
           } catch (err) {
             console.warn("Drop history item invalide", err);
           }
@@ -350,7 +360,7 @@ export default function QueueList({
                       <SortableQueueItem
                         key={item.id}
                         item={item}
-                        index={index}
+                        index={queue.slice(0, index).filter((q) => q.status !== "pending").length}
                         disabled={isBusy}
                         onRemove={onRemove}
                         onDropHistoryItem={onDropHistoryItem}

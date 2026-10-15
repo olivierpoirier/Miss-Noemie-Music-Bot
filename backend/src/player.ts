@@ -5,8 +5,10 @@ import {
   QueueItem,
   MpvHandle,
   MpvEvent,
-  nextId,
 } from "./types.js";
+import { queueService } from "./queue.js";
+import { playbackPosition, playbackClockAt, clampPlaybackPosition } from "../../shared/playback.js";
+import { recordDiagnostic, diagnosticErrorDetails } from "./diagnostics.js";
 import {
   startMpv,
   mpvPause,
@@ -22,15 +24,76 @@ import {
   normalizeUrl,
   resolvePlayable,
   searchYoutubeVideo,
+  invalidatePlayableSource,
   type PlayableSource,
 } from "./ytdlp.js";
 import { MPV_CONFIG, PLAYER_CONFIG } from "./config.js";
-import { isVirtualAudioRoutingReady } from "./utils.js";
+import { ensureAudioRoutingReady, isVirtualAudioRoutingReady } from "./utils.js";
 import type { AudioProfileName } from "./audioProfiles.js";
 
 let globalMpvHandle: MpvHandle | null = null;
-let isLooping = false;
+let mpvStartTask: Promise<MpvHandle> | null = null;
+let engineGeneration = 0;
+let playerLoopTask: Promise<void> | null = null;
+let loopRequested = false;
+let playbackGeneration = 0;
+let activeItem: QueueItem | null = null;
+let activeAbortController: AbortController | null = null;
+let preferredNextItem: QueueItem | null = null;
+let startingPlayback = false;
 let currentListener: ((ev: MpvEvent) => void) | null = null;
+let listenerHandle: MpvHandle | null = null;
+let progressTimer: ReturnType<typeof setInterval> | null = null;
+const playbackRetries = new Map<string, number>();
+const MAX_PLAYBACK_RETRIES = 1;
+const PLAYBACK_STALL_TIMEOUT_MS = 60_000;
+
+export function getPlayerDiagnostics() {
+  const handle = globalMpvHandle;
+  const item = activeItem || preferredNextItem;
+  const retryCount = item ? playbackRetries.get(item.id) ?? 0 : 0;
+  return {
+    engineRunning: Boolean(handle && handle.proc.exitCode === null &&
+      handle.proc.signalCode === null && !handle.proc.killed &&
+      handle.sock && !handle.sock.destroyed),
+    engineStarting: mpvStartTask !== null,
+    loopRunning: playerLoopTask !== null,
+    startingPlayback,
+    buffering: Boolean(state.now?.isBuffering),
+    recovering: retryCount > 0 && (startingPlayback || !playing),
+    retryCount,
+    currentItem: item ? { id: item.id, status: item.status } : null,
+    preloaded: preloaded.size,
+    preloading: preloading.size,
+  };
+}
+
+function detachPlaybackListener(): void {
+  if (currentListener && listenerHandle) listenerHandle.removeListener(currentListener);
+  currentListener = null;
+  listenerHandle = null;
+  if (progressTimer) clearInterval(progressTimer);
+  progressTimer = null;
+}
+
+function isCurrentAttempt(item: QueueItem, generation: number): boolean {
+  return playbackGeneration === generation && activeItem === item && item.status === "playing";
+}
+
+function cancelActiveAttempt(): void {
+  ++playbackGeneration;
+  activeAbortController?.abort();
+  activeAbortController = null;
+}
+
+function cancellable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const aborted = () => reject(new Error("Lecture annulée"));
+    if (signal.aborted) aborted();
+    else signal.addEventListener("abort", aborted, { once: true });
+    operation.then(resolve, reject).finally(() => signal.removeEventListener("abort", aborted));
+  });
+}
 
 /* ------------------- PRELOAD SYSTEM ------------------- */
 
@@ -42,33 +105,12 @@ type PreloadedSource = {
 type PreloadingSource = {
   audioProfile: AudioProfileName;
   task: Promise<PlayableSource | null>;
+  token: symbol;
 };
 
 let preloaded = new Map<string, PreloadedSource>();
 let preloading = new Map<string, PreloadingSource>();
 let preloadWorkerRunning = false;
-
-function computeCurrentPosition(): number {
-  if (!state.now) return 0;
-
-  if (state.control.paused || state.now.isBuffering || !state.now.startedAt) {
-    return state.now.positionOffsetSec || 0;
-  }
-
-  return Math.max(0, (Date.now() - state.now.startedAt) / 1000);
-}
-
-function pushToHistory(item: QueueItem): void {
-  const snapshot: QueueItem = {
-    ...item,
-    status: "done",
-  };
-
-  state.history = [
-    snapshot,
-    ...state.history.filter((h) => h.id !== item.id),
-  ].slice(0, 200);
-}
 
 function trimPreloadCache(): void {
   const usableIds = new Set(
@@ -118,24 +160,30 @@ function getUpcomingPreloadCandidates(): QueueItem[] {
 }
 
 function isPreloadedForCurrentProfile(itemId: string): boolean {
-  return preloaded.get(itemId)?.audioProfile === state.control.audioProfile;
+  const cached = preloaded.get(itemId);
+  return cached?.audioProfile === state.control.audioProfile && isFreshSource(cached.source);
+}
+
+function isFreshSource(source: PlayableSource): boolean {
+  return !source.expiresAt || source.expiresAt > Date.now() + 15_000;
 }
 
 async function resolveItemToSource(
-  item: QueueItem
+  item: QueueItem,
+  audioProfile: AudioProfileName
 ): Promise<PlayableSource | null> {
   const spotifyOk = await resolveSpotifyItem(item);
   if (!spotifyOk) return null;
 
   if (item.url.startsWith("provider:")) return null;
 
-  return getPlayableSource(normalizeUrl(item.url), state.control.audioProfile);
+  return getPlayableSource(normalizeUrl(item.url), audioProfile);
 }
 
 async function preloadTrack(item: QueueItem): Promise<PlayableSource | null> {
   if (!item) return null;
   const ready = preloaded.get(item.id);
-  if (ready?.audioProfile === state.control.audioProfile) return ready.source;
+  if (ready?.audioProfile === state.control.audioProfile && isFreshSource(ready.source)) return ready.source;
   if (ready) preloaded.delete(item.id);
   const pending = preloading.get(item.id);
   if (pending?.audioProfile === state.control.audioProfile) {
@@ -145,11 +193,12 @@ async function preloadTrack(item: QueueItem): Promise<PlayableSource | null> {
   if (item.status !== "queued") return null;
 
   const audioProfile = state.control.audioProfile;
-  const task = (async () => {
+  const token = Symbol(item.id);
+  const task: Promise<PlayableSource | null> = (async () => {
     try {
-      const source = await resolveItemToSource(item);
+      const source = await resolveItemToSource(item, audioProfile);
 
-      if (source && item.status === "queued") {
+      if (source && item.status === "queued" && preloading.get(item.id)?.token === token) {
         preloaded.set(item.id, { audioProfile, source });
         trimPreloadCache();
         console.log(`[player] ⚡ Préchargé: ${item.title || item.url}`);
@@ -160,11 +209,11 @@ async function preloadTrack(item: QueueItem): Promise<PlayableSource | null> {
       console.warn("[player] preload failed", err);
       return null;
     } finally {
-      preloading.delete(item.id);
+      if (preloading.get(item.id)?.token === token) preloading.delete(item.id);
     }
   })();
 
-  preloading.set(item.id, { audioProfile, task });
+  preloading.set(item.id, { audioProfile, task, token });
   return task;
 }
 
@@ -197,7 +246,7 @@ async function consumePreloaded(
   item: QueueItem
 ): Promise<PlayableSource | null> {
   const ready = preloaded.get(item.id);
-  if (ready?.audioProfile === state.control.audioProfile) {
+  if (ready?.audioProfile === state.control.audioProfile && isFreshSource(ready.source)) {
     preloaded.delete(item.id);
     return ready.source;
   }
@@ -212,7 +261,7 @@ async function consumePreloaded(
 
   const out = await pending.task;
   preloaded.delete(item.id);
-  return pending.audioProfile === state.control.audioProfile ? out : null;
+  return pending.audioProfile === state.control.audioProfile && out && isFreshSource(out) ? out : null;
 }
 
 function clearPreloadForItem(itemId: string): void {
@@ -221,6 +270,8 @@ function clearPreloadForItem(itemId: string): void {
 }
 
 function resetNowState(): void {
+  detachPlaybackListener();
+  activeItem = null;
   state.now = null;
   setPlaying(null);
 }
@@ -228,55 +279,66 @@ function resetNowState(): void {
 /* ------------------- MPV ------------------- */
 
 export async function ensureMpvRunning(): Promise<MpvHandle> {
-  if (!isVirtualAudioRoutingReady()) {
-    throw new Error(
-      "Le routage audio virtuel n'est pas prÃªt : MPV ne sera pas dÃ©marrÃ© sur la sortie systÃ¨me."
-    );
-  }
-
-  if (globalMpvHandle && globalMpvHandle.proc.exitCode === null) {
+  if (globalMpvHandle && globalMpvHandle.proc.exitCode === null &&
+      globalMpvHandle.proc.signalCode === null && !globalMpvHandle.proc.killed &&
+      globalMpvHandle.sock && !globalMpvHandle.sock.destroyed) {
     return globalMpvHandle;
   }
+  if (mpvStartTask) return mpvStartTask;
 
   console.log("[player] 🔥 Starting MPV engine");
-
-  globalMpvHandle = await startMpv("");
-
-  globalMpvHandle.proc.once("exit", () => {
-    console.warn("[player] MPV exited");
-    globalMpvHandle = null;
-
-    if (playing) {
-      resetNowState();
+  const generation = engineGeneration;
+  const task = (async () => {
+    await ensureAudioRoutingReady();
+    if (!isVirtualAudioRoutingReady()) {
+      throw new Error("Le routage audio virtuel n'est pas prêt : lecture bloquée.");
     }
-  });
-
-  return globalMpvHandle;
+    if (generation !== engineGeneration) throw new Error("Démarrage MPV annulé");
+    const handle = await startMpv("");
+    if (generation !== engineGeneration) {
+      handle.kill();
+      throw new Error("Démarrage MPV annulé");
+    }
+    globalMpvHandle = handle;
+    recordDiagnostic("MPV_STARTED");
+    handle.proc.once("exit", (code) => {
+      if (globalMpvHandle !== handle) return;
+      console.warn("[player] MPV exited");
+      recordDiagnostic("MPV_EXITED", { exitCode: code ?? undefined });
+      globalMpvHandle = null;
+      const item = playing?.handle === handle ? playing.item : null;
+      const notify = playbackStateChange;
+      if (item && notify && !startingPlayback) recoverPlayback(item, notify);
+    });
+    return handle;
+  })();
+  mpvStartTask = task;
+  try { return await task; }
+  finally { if (mpvStartTask === task) mpvStartTask = null; }
 }
+
+let playbackStateChange: (() => void) | null = null;
 
 /* ------------------- CORE PLAY ------------------- */
 
-async function attachListener(
+function attachListener(
   handle: MpvHandle,
   item: QueueItem,
-  onStateChange: () => void
-): Promise<void> {
-  const attemptId = item.id;
-
-  if (currentListener) {
-    handle.removeListener(currentListener);
-    currentListener = null;
-  }
+  onStateChange: () => void,
+  generation: number
+): void {
+  detachPlaybackListener();
+  let lastProgressAt = Date.now();
+  let lastPosition = -1;
 
   currentListener = (ev: MpvEvent) => {
-    if (!playing || playing.item.id !== attemptId) return;
+    if (!isCurrentAttempt(item, generation) || playing?.handle !== handle) return;
 
     if (ev.type === "playback-restart") {
+      lastProgressAt = Date.now();
       if (state.now) {
         state.now.isBuffering = false;
-        state.now.startedAt = state.control.paused
-          ? null
-          : Date.now() - ((state.now.positionOffsetSec || 0) * 1000);
+        Object.assign(state.now, playbackClockAt(state.now.positionOffsetSec ?? 0, state.control.paused));
 
         onStateChange();
       }
@@ -286,8 +348,8 @@ async function attachListener(
     if (ev.type === "end-file") {
       if (ev.reason === "eof") {
         handleEndOfTrack(item, onStateChange);
-      } else if (ev.reason === "error") {
-        failItemAndContinue(item, onStateChange);
+      } else if (!startingPlayback && (ev.reason === "error" || ev.reason === "stop")) {
+        recoverPlayback(item, onStateChange);
       }
       return;
     }
@@ -297,6 +359,10 @@ async function attachListener(
     if (ev.name === "time-pos" && typeof ev.data === "number") {
       const now = state.now;
       if (!now) return;
+      if (Math.abs(ev.data - lastPosition) > 0.01) {
+        lastPosition = ev.data;
+        lastProgressAt = Date.now();
+      }
 
       const wasBuffering = Boolean(now.isBuffering);
       let clientClockChanged = wasBuffering;
@@ -307,13 +373,12 @@ async function attachListener(
       }
 
       if (!state.control.paused) {
-        const theoreticalPos =
-          now.startedAt ? (Date.now() - now.startedAt) / 1000 : 0;
+        const theoreticalPos = playbackPosition(now, false, Date.now(), false);
 
         const drift = Math.abs(theoreticalPos - ev.data);
 
-        if (drift > 1 || !now.startedAt) {
-          now.startedAt = Date.now() - ev.data * 1000;
+        if (drift > 1 || now.startedAt == null || !Number.isFinite(now.startedAt)) {
+          Object.assign(now, playbackClockAt(ev.data));
           clientClockChanged = true;
         }
       }
@@ -333,25 +398,44 @@ async function attachListener(
       return;
     }
 
-    if (ev.name === "idle-active" && ev.data === true) {
-      const hasStarted = (state.now?.positionOffsetSec || 0) > 0;
-
-      if (playing?.item.id === attemptId && hasStarted) {
-        handleEndOfTrack(item, onStateChange);
-      }
+    if (ev.name === "paused-for-cache" && typeof ev.data === "boolean" && state.now) {
+      if (state.now.isBuffering === ev.data) return;
+      const position = playbackPosition(state.now, state.control.paused);
+      state.now.isBuffering = ev.data;
+      Object.assign(state.now, playbackClockAt(position, ev.data || state.control.paused));
+      onStateChange();
     }
   };
 
+  listenerHandle = handle;
   handle.on(currentListener);
+  progressTimer = setInterval(() => {
+    if (!isCurrentAttempt(item, generation)) return;
+    if (state.control.paused || startingPlayback) {
+      lastProgressAt = Date.now();
+      return;
+    }
+    if (Date.now() - lastProgressAt > PLAYBACK_STALL_TIMEOUT_MS) {
+      console.warn(`[player] Lecture bloquée depuis 60 s : ${item.title || item.id}`);
+      recordDiagnostic("PLAYBACK_STALLED", { trackId: item.id });
+      // Destroy the stuck engine; a retry must use a fresh transport and URL.
+      if (globalMpvHandle === handle) globalMpvHandle = null;
+      recoverPlayback(item, onStateChange);
+      handle.kill();
+    }
+  }, 5_000);
+  progressTimer.unref();
 }
 
 async function tryPlayWith(
   source: PlayableSource,
   item: QueueItem,
-  onStateChange: () => void
+  onStateChange: () => void,
+  generation: number
 ): Promise<boolean> {
   try {
     const handle = await ensureMpvRunning();
+    if (!isCurrentAttempt(item, generation)) return false;
 
     setPlaying({ item, handle });
 
@@ -370,16 +454,21 @@ async function tryPlayWith(
 
     onStateChange();
 
-    await attachListener(handle, item, onStateChange);
-
     await mpvSetAudioProfile(handle, state.control.audioProfile);
+    if (!isCurrentAttempt(item, generation)) return false;
     await mpvSetHttpHeaders(handle, source.headers);
+    if (!isCurrentAttempt(item, generation)) return false;
+    attachListener(handle, item, onStateChange, generation);
     await mpvLoadFile(handle, source.url, false);
+    if (!isCurrentAttempt(item, generation)) return false;
     await mpvSetLoopFile(handle, state.control.repeat);
+    if (!isCurrentAttempt(item, generation)) return false;
     await mpvPause(handle, state.control.paused);
     await handle.waitForPlaybackStart(MPV_CONFIG.globalStartTimeoutMs);
 
-    return true;
+    const started = isCurrentAttempt(item, generation);
+    if (started) recordDiagnostic("PLAYBACK_STARTED", { trackId: item.id });
+    return started;
   } catch (err) {
     console.error("[player] play error", err);
     return false;
@@ -452,41 +541,60 @@ function handleEndOfTrack(item: QueueItem, onStateChange: () => void): void {
   if (item.status !== "playing") return;
 
   if (state.control.repeat) {
-    if (state.now) {
-      state.now.positionOffsetSec = 0;
-      state.now.startedAt = Date.now();
-    }
+    item.status = "queued";
+    preferredNextItem = item;
+    cancelActiveAttempt();
+    resetNowState();
+    onStateChange();
+    void ensurePlayerLoop(onStateChange);
     return;
   }
 
   console.log("[player] ✅ Track finished");
 
   item.status = "done";
+  playbackRetries.delete(item.id);
+  cancelActiveAttempt();
   clearPreloadForItem(item.id);
-  pushToHistory(item);
+  queueService.addToHistory(item);
   resetNowState();
 
   onStateChange();
 
-  setTimeout(() => {
-    void ensurePlayerLoop(onStateChange);
-  }, 0);
+  void ensurePlayerLoop(onStateChange);
 }
 
-function failItemAndContinue(item: QueueItem, onStateChange: () => void): void {
-  item.status = "error";
+function recoverPlayback(item: QueueItem, onStateChange: () => void): void {
+  if (item.status !== "playing") return;
+  const retries = playbackRetries.get(item.id) || 0;
+  if (retries < MAX_PLAYBACK_RETRIES) {
+    playbackRetries.set(item.id, retries + 1);
+    invalidatePlayableSource(item.url, state.control.audioProfile);
+    item.status = "queued";
+    preferredNextItem = item;
+    console.warn(`[player] Nouvelle tentative avec une source fraîche : ${item.title || item.id}`);
+    recordDiagnostic("PLAYBACK_RETRY", { trackId: item.id, attempt: retries + 1 });
+  } else {
+    item.status = "error";
+    playbackRetries.delete(item.id);
+    console.error(`[player] Piste abandonnée après deux échecs : ${item.title || item.id}`);
+    recordDiagnostic("PLAYBACK_ABANDONED", { trackId: item.id, attempt: retries + 1 });
+  }
+  cancelActiveAttempt();
   clearPreloadForItem(item.id);
   resetNowState();
   onStateChange();
-
-  setTimeout(() => {
-    void ensurePlayerLoop(onStateChange);
-  }, 100);
+  void ensurePlayerLoop(onStateChange);
 }
 
 /* ------------------- QUEUE LOOP ------------------- */
 
 function pickNextQueuedItem(): QueueItem | null {
+  if (preferredNextItem) {
+    const preferred = preferredNextItem;
+    preferredNextItem = null;
+    if (preferred.status === "queued" && state.queue.includes(preferred)) return preferred;
+  }
   const queued = state.queue.filter((q) => q.status === "queued");
   if (!queued.length) return null;
 
@@ -502,74 +610,92 @@ function pickNextQueuedItem(): QueueItem | null {
 }
 
 export async function ensurePlayerLoop(onStateChange: () => void): Promise<void> {
-  if (isLooping) return;
-  if (playing && playing.item.status === "playing") return;
+  playbackStateChange = onStateChange;
+  loopRequested = true;
+  if (playerLoopTask) return playerLoopTask;
 
-  isLooping = true;
+  const runGeneration = engineGeneration;
+  const task = (async () => {
+    do {
+      loopRequested = false;
+      if (runGeneration !== engineGeneration) break;
+      if (playing?.item.status === "playing") break;
+      const nextItem = pickNextQueuedItem();
+      if (!nextItem) {
+        resetNowState();
+        onStateChange();
+        break;
+      }
 
-  try {
-    const nextItem = pickNextQueuedItem();
-
-    if (!nextItem) {
-      resetNowState();
-      onStateChange();
-      return;
-    }
-
-    console.log("[player] 🎵 Starting", nextItem.title || nextItem.url);
-
-    const spotifyOk = await resolveSpotifyItem(nextItem);
-    if (!spotifyOk) {
-      failItemAndContinue(nextItem, onStateChange);
-      return;
-    }
-
-    nextItem.status = "playing";
-    schedulePreloadWorker();
-
-    const source = await resolvePlaybackSource(nextItem);
-
-    if (!source) {
-      console.error("[player] unable to resolve playable URL");
-      failItemAndContinue(nextItem, onStateChange);
-      return;
-    }
-
-    const success = await tryPlayWith(source, nextItem, onStateChange);
-
-    if (!success) {
-      failItemAndContinue(nextItem, onStateChange);
-      return;
-    }
-  } catch (err) {
-    console.error("[player] loop error", err);
-  } finally {
-    isLooping = false;
+      console.log("[player] 🎵 Starting", nextItem.title || nextItem.url);
+      nextItem.status = "playing";
+      activeItem = nextItem;
+      const generation = ++playbackGeneration;
+      const controller = new AbortController();
+      activeAbortController = controller;
+      startingPlayback = true;
+      try {
+        const spotifyOk = await cancellable(resolveSpotifyItem(nextItem), controller.signal);
+        if (!isCurrentAttempt(nextItem, generation)) throw new Error("Lecture annulée");
+        if (!spotifyOk) throw new Error("Résolution Spotify impossible");
+        schedulePreloadWorker();
+        const source = await cancellable(resolvePlaybackSource(nextItem), controller.signal);
+        if (!isCurrentAttempt(nextItem, generation)) throw new Error("Lecture annulée");
+        if (!source) throw new Error("URL de lecture introuvable");
+        const success = await cancellable(tryPlayWith(source, nextItem, onStateChange, generation), controller.signal);
+        if (!success && isCurrentAttempt(nextItem, generation)) throw new Error("Échec du démarrage MPV");
+      } catch (error) {
+        if (isCurrentAttempt(nextItem, generation)) {
+          console.error("[player] loop error", error);
+          recordDiagnostic("PLAYBACK_RESOLUTION_FAILED", { trackId: nextItem.id, ...diagnosticErrorDetails(error) });
+          // A timed-out load may still be active inside MPV. End it before
+          // starting the replacement, with the old listener already detached.
+          detachPlaybackListener();
+          const handle = playing?.handle;
+          if (handle) {
+            try { await mpvStop(handle); } catch {}
+          }
+          if (isCurrentAttempt(nextItem, generation)) recoverPlayback(nextItem, onStateChange);
+        }
+      } finally {
+        startingPlayback = false;
+      }
+      if (runGeneration === engineGeneration && !playing &&
+          state.queue.some((item) => item.status === "queued")) loopRequested = true;
+    } while (loopRequested);
+  })();
+  playerLoopTask = task;
+  try { await task; }
+  finally {
+    if (playerLoopTask === task) playerLoopTask = null;
+    if (loopRequested && !playing) void ensurePlayerLoop(onStateChange);
   }
 }
 
 /* ------------------- ACTIONS ------------------- */
 
 export async function skip(onStateChange: () => void): Promise<void> {
-  if (!playing) {
+  const currentItem = playing?.item || activeItem;
+  if (!currentItem) {
     void ensurePlayerLoop(onStateChange);
     return;
   }
 
   console.log("[player] ⏭ skip");
 
-  const h = playing.handle;
-  const currentItem = playing.item;
+  const h = playing?.handle;
 
   currentItem.status = "done";
+  playbackRetries.delete(currentItem.id);
+  cancelActiveAttempt();
   clearPreloadForItem(currentItem.id);
-  pushToHistory(currentItem);
+  queueService.addToHistory(currentItem);
   resetNowState();
 
   onStateChange();
 
   try {
-    await mpvStop(h);
+    if (h) await mpvStop(h);
   } catch {}
 
   void ensurePlayerLoop(onStateChange);
@@ -579,108 +705,91 @@ export async function seekRelative(
   deltaSec: number,
   onStateChange: () => void
 ): Promise<void> {
+  await seekAbsolute(playbackPosition(state.now, state.control.paused) + deltaSec, onStateChange);
+}
+
+export async function seekAbsolute(
+  positionSec: number,
+  onStateChange: () => void
+): Promise<void> {
+  if (!Number.isFinite(positionSec)) throw new Error("Position invalide");
   const h = playing?.handle;
-  if (!h || !state.now) return;
-
-  const current = computeCurrentPosition();
-  const target = Math.max(0, current + deltaSec);
-
-  state.now.positionOffsetSec = target;
-  state.now.startedAt = null;
-  state.now.isBuffering = true;
+  const now = state.now;
+  if (!h || !now) return;
+  const generation = playbackGeneration;
+  const target = clampPlaybackPosition(positionSec, now.durationSec);
+  const snapshot = { positionOffsetSec: now.positionOffsetSec, startedAt: now.startedAt, isBuffering: now.isBuffering };
+  now.positionOffsetSec = target;
+  now.startedAt = null;
+  now.isBuffering = true;
 
   onStateChange();
-  await mpvSeekAbsolute(h, target);
+  try {
+    await mpvSeekAbsolute(h, target);
+  } catch (error) {
+    if (state.now === now && generation === playbackGeneration &&
+        now.isBuffering && now.positionOffsetSec === target) {
+      Object.assign(now, snapshot);
+      onStateChange();
+    }
+    throw error;
+  }
 }
 
 export async function playPrevious(onStateChange: () => void): Promise<void> {
-  if (state.now && computeCurrentPosition() > 5 && playing?.handle) {
-    state.now.positionOffsetSec = 0;
-    state.now.startedAt = state.control.paused ? null : Date.now();
-    state.now.isBuffering = true;
-
-    onStateChange();
-    await mpvSeekAbsolute(playing.handle, 0);
+  if (state.now && playbackPosition(state.now, state.control.paused) > 5 && playing?.handle) {
+    await seekAbsolute(0, onStateChange);
     return;
   }
 
-  const previous = state.history[0];
-  if (!previous) return;
+  const handle = playing?.handle;
+  const currentItem = playing?.item || activeItem;
+  const previousClone = queueService.restorePrevious(currentItem);
+  if (!previousClone) return;
+  if (currentItem) playbackRetries.delete(currentItem.id);
 
-  state.history = state.history.slice(1);
-
-  const previousClone: QueueItem = {
-    ...previous,
-    id: String(nextId.current++),
-    createdAt: Date.now(),
-    status: "queued",
-  };
-
-  const currentItem = playing?.item ?? null;
-  const doneOrError = state.queue.filter(
-    (q) => q.status !== "queued" && q.status !== "playing"
-  );
-  const queued = state.queue.filter(
-    (q) => q.status === "queued" && q.id !== currentItem?.id
-  );
-
-  if (currentItem) {
-    currentItem.status = "queued";
-  }
-
-  state.queue = [
-    ...doneOrError,
-    previousClone,
-    ...(currentItem ? [currentItem] : []),
-    ...queued,
-  ];
-
+  cancelActiveAttempt();
+  preferredNextItem = previousClone;
   resetNowState();
   onStateChange();
 
   try {
-    if (playing?.handle) {
-      await mpvStop(playing.handle);
-    }
+    if (handle) await mpvStop(handle);
   } catch {}
 
   void ensurePlayerLoop(onStateChange);
 }
 
 export async function skipGroup(onStateChange: () => void): Promise<void> {
-  const currentGroup = playing?.item?.group;
+  const currentGroup = (playing?.item || activeItem)?.group;
   if (!currentGroup) {
     await skip(onStateChange);
     return;
   }
 
-  for (const item of state.queue) {
-    if (item.status === "queued" && item.group === currentGroup) {
-      item.status = "done";
-    }
-  }
+  queueService.finishQueuedGroup(currentGroup);
 
   await skip(onStateChange);
 }
 
 export async function stopPlayer(onStateChange: () => void): Promise<void> {
-  if (globalMpvHandle) {
+  cancelActiveAttempt();
+  ++engineGeneration;
+  loopRequested = false;
+  mpvStartTask = null;
+  const handle = globalMpvHandle;
+  globalMpvHandle = null;
+  if (handle) {
     try {
-      globalMpvHandle.kill();
+      handle.kill();
     } catch {}
-    globalMpvHandle = null;
   }
 
   preloaded.clear();
   preloading.clear();
-
-  if (currentListener && playing?.handle) {
-    try {
-      playing.handle.removeListener(currentListener);
-    } catch {}
-    currentListener = null;
-  }
-
+  playbackRetries.clear();
+  preferredNextItem = null;
+  if (activeItem?.status === "playing") activeItem.status = "done";
   resetNowState();
   onStateChange();
 }

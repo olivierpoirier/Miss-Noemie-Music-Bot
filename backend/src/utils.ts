@@ -52,6 +52,8 @@ function runCommand(command: string, args: string[]) {
     const result = spawnSync(command, args, {
       encoding: "utf8",
       windowsHide: true,
+      timeout: 5_000,
+      maxBuffer: 1024 * 1024,
     });
 
     return {
@@ -104,22 +106,18 @@ async function configureVoicemeeterSettings(): Promise<void> {
   const Voicemeeter = await getVoicemeeterApi();
   const vm = await Voicemeeter.init();
 
-  vm.connect();
-
-  await new Promise((resolve) => setTimeout(resolve, 2000));
-
-  const virtualInputs = [3, 4];
-
-  virtualInputs.forEach((index) => {
-    vm.setStripParameter(index, "A1" as any, 1);
-    vm.setStripParameter(index, "B2" as any, 1);
-    vm.setStripParameter(index, "Gain" as any, 0);
-  });
-
-  console.log("✅ VoiceMeeter : A1 et B2 configurés avec succès.");
-
-  await new Promise((resolve) => setTimeout(resolve, 500));
-  vm.disconnect();
+  try {
+    vm.connect();
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    for (const index of [3, 4]) {
+      await vm.setStripParameter(index, "A1", 1);
+      await vm.setStripParameter(index, "B2", 1);
+      await vm.setStripParameter(index, "Gain", 0);
+    }
+    console.log("✅ VoiceMeeter : A1 et B2 configurés avec succès.");
+  } finally {
+    if (vm.isConnected) vm.disconnect();
+  }
 }
 
 async function ensureWindowsAudioReady(): Promise<boolean> {
@@ -132,7 +130,7 @@ async function ensureWindowsAudioReady(): Promise<boolean> {
       virtualMonitorSource: null,
       degraded: true,
       message:
-        "VoiceMeeter introuvable. Le bot démarre quand même, mais utilisera la sortie audio système par défaut.",
+        "VoiceMeeter introuvable. La lecture est bloquée jusqu'à ce que le routage virtuel soit prêt.",
     });
 
     return false;
@@ -146,6 +144,12 @@ async function ensureWindowsAudioReady(): Promise<boolean> {
         windowsHide: true,
       });
 
+      // Spawn errors arrive asynchronously and must have a listener even when
+      // the executable existed during the preceding filesystem check.
+      await new Promise<void>((resolve, reject) => {
+        child.once("spawn", resolve);
+        child.once("error", reject);
+      });
       child.unref();
 
       await new Promise((resolve) => setTimeout(resolve, 5000));
@@ -171,7 +175,7 @@ async function ensureWindowsAudioReady(): Promise<boolean> {
       virtualMonitorSource: null,
       degraded: true,
       message:
-        "VoiceMeeter a échoué à s'initialiser. Le bot démarre quand même avec la sortie audio système par défaut.",
+        "VoiceMeeter a échoué à s'initialiser. La lecture reste bloquée.",
     });
 
     return false;
@@ -225,15 +229,7 @@ function findSourceByName(name: string): PactlShortEntry | null {
 }
 
 function getMonitorSourceNameForSink(sinkName: string): string | null {
-  const exact = `${sinkName}.monitor`;
-
-  const exactMatch = findSourceByName(exact);
-  if (exactMatch) return exactMatch.name;
-
-  const sources = listPactlShort("sources");
-  const fuzzy = sources.find((entry) => entry.name.includes(exact));
-
-  return fuzzy?.name || null;
+  return findSourceByName(`${sinkName}.monitor`)?.name || null;
 }
 
 function createLinuxNullSink(
@@ -268,19 +264,6 @@ function createLinuxNullSink(
 }
 
 async function ensureLinuxAudioReady(): Promise<boolean> {
-  if (!AUDIO_CONFIG.linuxEnableVirtualSink) {
-    setRuntimeAudioRouting({
-      audioDevice: null,
-      virtualSinkName: null,
-      virtualMonitorSource: null,
-      degraded: false,
-      message:
-        "Création automatique du sink virtuel Linux désactivée. MPV utilisera la sortie audio par défaut.",
-    });
-
-    return true;
-  }
-
   if (!pactlAvailable()) {
     setRuntimeAudioRouting({
       audioDevice: null,
@@ -300,7 +283,7 @@ async function ensureLinuxAudioReady(): Promise<boolean> {
   let sink = findSinkByName(sinkName);
 
   if (!sink) {
-    const created = createLinuxNullSink(sinkName, description);
+    const created = AUDIO_CONFIG.linuxEnableVirtualSink && createLinuxNullSink(sinkName, description);
     if (!created) {
       setRuntimeAudioRouting({
         audioDevice: null,
@@ -308,7 +291,7 @@ async function ensureLinuxAudioReady(): Promise<boolean> {
         virtualMonitorSource: null,
         degraded: true,
         message:
-          "Le sink virtuel Linux n'a pas pu être créé. Le bot utilisera la sortie audio par défaut.",
+          "Le sink virtuel Linux est absent. Active sa création automatique ou crée le sink configuré avant la lecture.",
       });
 
       return false;
@@ -330,8 +313,17 @@ async function ensureLinuxAudioReady(): Promise<boolean> {
     return false;
   }
 
-  const monitorSource =
-    getMonitorSourceNameForSink(sinkName) || `${sinkName}.monitor`;
+  const monitorSource = getMonitorSourceNameForSink(sinkName);
+  if (!monitorSource) {
+    setRuntimeAudioRouting({
+      audioDevice: null,
+      virtualSinkName: sinkName,
+      virtualMonitorSource: null,
+      degraded: true,
+      message: `La source d'entrée ${sinkName}.monitor est absente. La lecture reste bloquée.`,
+    });
+    return false;
+  }
 
   setRuntimeAudioRouting({
     audioDevice: `pulse/${sinkName}`,
@@ -348,7 +340,7 @@ async function ensureLinuxAudioReady(): Promise<boolean> {
 /* PUBLIC API                                       */
 /* ------------------------------------------------ */
 
-export async function ensureAudioRoutingReady(): Promise<boolean> {
+async function prepareAudioRouting(): Promise<boolean> {
   runtimeAudioRouting = {
     audioDevice: null,
     virtualSinkName: null,
@@ -369,10 +361,21 @@ export async function ensureAudioRoutingReady(): Promise<boolean> {
     audioDevice: null,
     virtualSinkName: null,
     virtualMonitorSource: null,
-    degraded: false,
+    degraded: true,
     message:
-      "Plateforme sans routage audio virtuel dédié. MPV utilisera la sortie audio par défaut.",
+      "Cette plateforme ne dispose pas de routage audio virtuel configuré. La lecture reste bloquée.",
   });
 
-  return true;
+  return false;
+}
+
+let routingTask: Promise<boolean> | null = null;
+
+export function ensureAudioRoutingReady(): Promise<boolean> {
+  // Concurrent requests must not create several sinks or log in to the native
+  // VoiceMeeter API simultaneously.
+  if (!routingTask) {
+    routingTask = prepareAudioRouting().finally(() => { routingTask = null; });
+  }
+  return routingTask;
 }

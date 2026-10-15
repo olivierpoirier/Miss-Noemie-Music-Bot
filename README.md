@@ -73,7 +73,7 @@ Le backend répond sur `http://localhost:4000`. Le frontend démarre sur `http:/
 
 Le mode local complet a besoin de:
 
-- Node.js et npm.
+- Node.js 22.12 ou plus récent et npm.
 - `mpv` disponible dans le `PATH`, ou configuré avec `MPV_BIN`.
 - Une route audio virtuelle prête avant la lecture.
 - Windows: VoiceMeeter, avec le périphérique `WINDOWS_MPV_AUDIO_DEVICE` configuré au besoin.
@@ -88,6 +88,9 @@ Le backend vérifie le routage au démarrage. Si l'entrée virtuelle n'est pas p
 npm run build:backend
 npm run build:frontend
 npm run build:frontend:vercel
+npm test
+npm run lint
+npm run doctor
 ```
 
 Le build local du frontend écrit dans `frontend/dist`, qui est servi par le backend local. Le build Vercel écrit dans `frontend/dist-vercel` pour garder la démo séparée du vrai mode local.
@@ -114,11 +117,15 @@ Cette séparation est importante: le mode local doit continuer à servir `fronte
 |-- api/demo.js                         # Backend léger pour la démo Vercel
 |-- backend/src/server.ts               # API HTTP, Socket.IO et routes de contrôle
 |-- backend/src/player.ts               # Boucle de lecture, file, historique, préchargement
+|-- backend/src/queue.ts                # Mutations de la file et de l'historique
+|-- backend/src/diagnostics.ts          # Journal persistant et événements bornés
+|-- backend/src/toolDiagnostics.ts      # Vérification des exécutables utilisés
 |-- backend/src/mpv.ts                  # Pilotage mpv et profils audio
 |-- backend/src/platforms/              # Détection YouTube, SoundCloud, Spotify, Twitch, direct
 |-- frontend/src/App.tsx                # Composition de l'interface
 |-- frontend/src/hooks/useLiveQueue.ts  # Client local Socket.IO ou client de démo Vercel
 |-- frontend/src/components/            # Lecteur, file, historique, thèmes, alertes
+|-- shared/                             # Types et horloge communs
 `-- scripts/dev.mjs                     # Lanceur local backend + frontend + Cloudflare
 ```
 
@@ -126,6 +133,8 @@ Cette séparation est importante: le mode local doit continuer à servir `fronte
 
 | Variable | Rôle |
 | --- | --- |
+| `PORT` | Port du backend (4000 par défaut); le lanceur configure aussi le proxy Vite. |
+| `IDLE_SHUTDOWN_MS` | Délai d'arrêt après la déconnexion de tous les clients. Désactivé par défaut (`0`); `60000` rétablit l'ancien arrêt après une minute. |
 | `MPV_BIN` | Chemin personnalisé vers `mpv`. |
 | `AUDIO_PROFILE` | Profil audio par défaut: `balanced` ou `xbox`. |
 | `WINDOWS_MPV_AUDIO_DEVICE` | Périphérique audio Windows utilisé par `mpv`. |
@@ -133,7 +142,23 @@ Cette séparation est importante: le mode local doit continuer à servir `fronte
 | `YTDLP_COOKIES_PATH` | Fichier cookies pour aider la résolution YouTube. |
 | `SPOTIFY_CLIENT_ID` | Identifiant Spotify, si les liens Spotify sont utilisés. |
 | `SPOTIFY_CLIENT_SECRET` | Secret Spotify. |
-| `SPOTIFY_REFRESH_TOKEN` | Optionnel. Laisse vide pour les liens publics; regenere-le seulement si tu veux acceder a des donnees Spotify privees. |
+| `SPOTIFY_REFRESH_TOKEN` | Autorisation utilisateur Spotify. Les titres et albums peuvent utiliser les identifiants de l'application; l'accès aux playlists dépend des droits utilisateur et du mode de l'application. |
+| `SPOTIFY_MARKET` | Marché Spotify sur deux lettres, `FR` par défaut. Utilise `CA` pour le catalogue canadien. |
+| `LINUX_ENABLE_VIRTUAL_SINK` | Crée le sink virtuel automatiquement par défaut. Avec `false`, un sink existant portant le nom configuré reste utilisable. |
+| `LINUX_VIRTUAL_SINK_NAME` | Nom du sink Linux, `xmbot_sink` par défaut; sa source `.monitor` doit être présente. |
+| `DIAGNOSTICS_ENABLED` | Journal persistant activé par défaut; `false` conserve uniquement les événements en mémoire. |
+| `DIAGNOSTICS_LOG_DIR` | Dossier du journal, `.data/logs` à la racine du projet par défaut. |
+| `DIAGNOSTICS_MAX_BYTES` | Taille maximale par fichier de journal, 1 Mio par défaut; trois fichiers au maximum. |
+
+Le bot continue à jouer lorsque le navigateur se ferme ou que le tunnel se reconnecte. En cas de sortie de mpv ou d'absence de progression pendant 60 secondes hors pause, le lecteur tente une fois de relancer la piste avec une URL fraîche, puis passe à la suivante si elle échoue encore. Une reprise automatique recommence la piste au début.
+
+Les appels Spotify et les résolutions de médias ont des délais limités. Certaines playlists Spotify peuvent être refusées par l'API même si leur page web est publique; consulte les [conditions d'accès de Spotify](https://developer.spotify.com/documentation/web-api/reference/get-playlists-items).
+
+`GET /health` expose l'état du routage audio, le nombre de clients et la longueur de la file pour faciliter le diagnostic. Le [rapport d'audit](docs/AUDIT.md) détaille les corrections, les tests et les limites restantes.
+
+Le panneau **Diagnostic du bot** affiche l'état du serveur, de mpv et du routage, les erreurs récentes et le chemin exact des outils. Il se rafraîchit uniquement lorsqu'il est ouvert et que l'onglet est visible. Un export JSON permet de conserver un relevé pour un diagnostic.
+
+`npm run doctor` vérifie les versions des exécutables réellement configurés. `npm run update:ytdlp` met à jour cette copie de yt-dlp explicitement, y compris celle installée dans le backend; la commande nécessite une connexion réseau et les droits d'écriture sur l'exécutable. Aucune mise à jour automatique n'est effectuée pendant la lecture. Voir le [guide de diagnostic](docs/DIAGNOSTICS.md).
 
 ## Notes de développement
 

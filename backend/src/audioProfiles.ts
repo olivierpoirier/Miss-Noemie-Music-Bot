@@ -1,4 +1,5 @@
-export type AudioProfileName = "balanced" | "xbox";
+import type { AudioProfileName } from "../../shared/contracts.js";
+export type { AudioProfileName } from "../../shared/contracts.js";
 
 export type AudioProfileConfig = {
   label: string;

@@ -4,9 +4,10 @@ interface Props {
   isOpen: boolean;
   message?: string | null;
   rainbow?: boolean;
+  onShowDiagnostics?: () => void;
 }
 
-export default function SystemAlert({ isOpen, message, rainbow }: Props) {
+export default function SystemAlert({ isOpen, message, rainbow, onShowDiagnostics }: Props) {
   if (!isOpen) return null;
 
   return (
@@ -44,8 +45,18 @@ export default function SystemAlert({ isOpen, message, rainbow }: Props) {
           Configurer VoiceMeeter
         </a>
 
+        {onShowDiagnostics && (
+          <button
+            type="button"
+            onClick={onShowDiagnostics}
+            className="mt-3 w-full rounded-xl border border-white/30 px-6 py-3 font-semibold transition-colors hover:bg-white/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
+          >
+            Voir le diagnostic
+          </button>
+        )}
+
         <p className="mt-4 text-[10px] uppercase opacity-50 italic">
-          Redemarrer le serveur apres la configuration
+          La lecture reste bloquée jusqu’au rétablissement du routage audio.
         </p>
       </div>
     </div>

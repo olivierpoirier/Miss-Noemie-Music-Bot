@@ -2,6 +2,7 @@ import { spawn, spawnSync, type ChildProcess } from "child_process";
 import fs from "fs";
 import net from "net";
 import crypto from "crypto";
+import { recordDiagnostic, diagnosticErrorDetails } from "./diagnostics.js";
 import { EventEmitter } from "events";
 import { MPV_CONFIG } from "./config.js";
 import {
@@ -76,9 +77,12 @@ export class MpvInstance extends EventEmitter {
 
   private ipcPath: string;
   private buffer = "";
-  private startResolve: (() => void) | null = null;
-  private startReject: ((error: Error) => void) | null = null;
   private startError: Error | null = null;
+  private terminalError: Error | null = null;
+  private awaitingFileStart = false;
+  private requestId = 0;
+  private commands = new Map<number, { resolve: () => void; reject: (error: Error) => void }>();
+  private playbackWaiters = new Set<{ resolve: () => void; reject: (error: Error) => void }>();
   private lastLogs: string[] = [];
 
   constructor(proc: ChildProcess, ipcPath: string) {
@@ -96,6 +100,7 @@ export class MpvInstance extends EventEmitter {
       await this.send({ command: ["observe_property", 1, "duration"] });
       await this.send({ command: ["observe_property", 2, "idle-active"] });
       await this.send({ command: ["observe_property", 3, "time-pos"] });
+      await this.send({ command: ["observe_property", 4, "paused-for-cache"] });
       await this.send({ command: ["set_property", "pause", true] });
     } catch (err) {
       this.handleCrash();
@@ -104,20 +109,36 @@ export class MpvInstance extends EventEmitter {
   }
 
   public send(cmd: Record<string, any>): Promise<void> {
-    return new Promise<void>((resolve) => {
+    return new Promise<void>((resolve, reject) => {
       if (!this.sock || this.sock.destroyed || !this.sock.writable) {
-        return resolve();
+        reject(this.terminalError || new Error("Connexion IPC MPV indisponible"));
+        return;
       }
 
+      const requestId = ++this.requestId;
+      const timeout = setTimeout(() => {
+        this.commands.delete(requestId);
+        const error = new Error("Timeout commande IPC MPV");
+        reject(error);
+        this.failTransport(error);
+      }, MPV_CONFIG.ipcConnectTimeoutMs);
+      this.commands.set(requestId, {
+        resolve: () => { clearTimeout(timeout); resolve(); },
+        reject: (error) => { clearTimeout(timeout); reject(error); },
+      });
+
       try {
-        this.sock.write(JSON.stringify(cmd) + "\n", () => resolve());
-      } catch {
-        resolve();
+        this.sock.write(JSON.stringify({ ...cmd, request_id: requestId }) + "\n", (error) => {
+          if (error) this.failTransport(error);
+        });
+      } catch (error) {
+        this.failTransport(error instanceof Error ? error : new Error(String(error)));
       }
     });
   }
 
   public kill(): void {
+    this.failTransport(new Error("MPV arrêté"), false);
     this.removeAllListeners();
 
     try {
@@ -129,7 +150,9 @@ export class MpvInstance extends EventEmitter {
 
     if (this.proc.pid) {
       if (process.platform === "win32") {
-        spawn("taskkill", ["/pid", this.proc.pid.toString(), "/f", "/t"]);
+        spawn("taskkill", ["/pid", this.proc.pid.toString(), "/f", "/t"], {
+          stdio: "ignore", windowsHide: true,
+        }).on("error", (error) => console.warn("[mpv] taskkill failed:", error));
       } else {
         this.proc.kill("SIGKILL");
       }
@@ -139,37 +162,29 @@ export class MpvInstance extends EventEmitter {
   public waitForPlaybackStart(
     timeoutMs = MPV_CONFIG.globalStartTimeoutMs
   ): Promise<void> {
+    if (this.terminalError) return Promise.reject(this.terminalError);
     if (this.started) return Promise.resolve();
     if (this.startError) return Promise.reject(this.startError);
 
     return new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        this.startResolve = null;
-        this.startReject = null;
+        this.playbackWaiters.delete(waiter);
         reject(new Error(`Timeout lecture mpv ${timeoutMs}ms`));
       }, timeoutMs);
 
-      this.startResolve = () => {
-        clearTimeout(timeout);
-        this.startResolve = null;
-        this.startReject = null;
-        resolve();
+      const waiter = {
+        resolve: () => { clearTimeout(timeout); resolve(); },
+        reject: (error: Error) => { clearTimeout(timeout); reject(error); },
       };
-
-      this.startReject = (error) => {
-        clearTimeout(timeout);
-        this.startResolve = null;
-        this.startReject = null;
-        reject(error);
-      };
+      this.playbackWaiters.add(waiter);
     });
   }
 
   public prepareForPlayback(): void {
+    this.settlePlayback(new Error("Lecture MPV remplacée"));
     this.started = false;
     this.startError = null;
-    this.startResolve = null;
-    this.startReject = null;
+    this.awaitingFileStart = true;
   }
 
   /* ------------------- PRIVATE ------------------- */
@@ -211,6 +226,13 @@ export class MpvInstance extends EventEmitter {
     this.proc.stderr?.on("data", capture);
     this.proc.on("error", (err) => {
       console.error("[SYSTEM-ERROR] Impossible de lancer MPV :", err);
+      this.failTransport(err);
+    });
+    this.proc.once("exit", (code, signal) => {
+      this.failTransport(new Error(`MPV terminé (${signal || code})`), false);
+      if (process.platform !== "win32") {
+        try { fs.unlinkSync(this.ipcPath); } catch {}
+      }
     });
   }
 
@@ -218,6 +240,8 @@ export class MpvInstance extends EventEmitter {
     if (!this.sock) return;
 
     this.sock.setEncoding("utf8");
+    this.sock.on("error", (error) => this.failTransport(error));
+    this.sock.on("close", () => this.failTransport(new Error("Connexion IPC MPV fermée")));
 
     this.sock.on("data", (chunk: string) => {
       this.buffer += chunk;
@@ -238,27 +262,46 @@ export class MpvInstance extends EventEmitter {
   }
 
   private processMessage(obj: any): void {
+    if (typeof obj?.request_id === "number") {
+      const pending = this.commands.get(obj.request_id);
+      if (pending) {
+        this.commands.delete(obj.request_id);
+        if (obj.error && obj.error !== "success") {
+          pending.reject(new Error(`Commande MPV refusée : ${obj.error}`));
+        } else {
+          pending.resolve();
+        }
+      }
+    }
+
     let eventToEmit: MpvEvent | null = null;
 
-    if (obj?.event === "file-loaded") {
+    if (obj?.event === "start-file") {
+      this.awaitingFileStart = false;
+    } else if (obj?.event === "file-loaded") {
+      if (this.awaitingFileStart) return;
+      // A paused file can load successfully without playback-restart/time-pos.
+      this.markStarted();
       eventToEmit = { type: "file-loaded" };
     } else if (obj?.event === "playback-restart") {
-      if (!this.started) {
-        this.started = true;
-        this.startResolve?.();
-      }
+      if (this.awaitingFileStart) return;
+      this.markStarted();
       eventToEmit = { type: "playback-restart" };
     } else if (obj?.event === "end-file") {
+      // loadfile replace first ends the old file; that event belongs to the
+      // previous attempt until MPV announces start-file for the replacement.
+      if (this.awaitingFileStart) return;
       const reason = typeof obj.reason === "string" ? obj.reason : undefined;
       const error = typeof obj.error === "string" ? obj.error : undefined;
 
-      if (!this.started) {
+      if (!this.started || reason === "error") {
+        this.started = false;
         this.startError = new Error(
           `MPV n'a pas pu ouvrir le flux${reason ? ` (${reason})` : ""}${
             error ? `: ${error}` : ""
           }`
         );
-        this.startReject?.(this.startError);
+        this.settlePlayback(this.startError);
       }
 
       eventToEmit = { type: "end-file", reason, error };
@@ -266,6 +309,7 @@ export class MpvInstance extends EventEmitter {
       obj?.event === "property-change" &&
       typeof obj.name === "string"
     ) {
+      if (this.awaitingFileStart) return;
       eventToEmit = {
         type: "property-change",
         name: obj.name,
@@ -273,18 +317,44 @@ export class MpvInstance extends EventEmitter {
       };
 
       if (
-        (obj.name === "time-pos" || obj.name === "duration") &&
+        obj.name === "time-pos" &&
         !this.started &&
         typeof obj.data === "number"
       ) {
-        this.started = true;
-        this.startResolve?.();
+        this.markStarted();
       }
     }
 
     if (eventToEmit) {
       this.emit("mpv-event", eventToEmit);
       this.emit(eventToEmit.type, eventToEmit);
+    }
+  }
+
+  private markStarted(): void {
+    this.started = true;
+    this.settlePlayback();
+  }
+
+  private settlePlayback(error?: Error): void {
+    for (const waiter of this.playbackWaiters) {
+      if (error) waiter.reject(error);
+      else waiter.resolve();
+    }
+    this.playbackWaiters.clear();
+  }
+
+  private failTransport(error: Error, terminate = true): void {
+    if (this.terminalError) return;
+    if (terminate) recordDiagnostic("MPV_TRANSPORT_FAILED", diagnosticErrorDetails(error));
+    this.terminalError = error;
+    this.startError = error;
+    this.settlePlayback(error);
+    for (const pending of this.commands.values()) pending.reject(error);
+    this.commands.clear();
+    this.sock?.destroy();
+    if (terminate && this.proc.pid && this.proc.exitCode === null) {
+      this.proc.kill("SIGKILL");
     }
   }
 
@@ -295,20 +365,25 @@ export class MpvInstance extends EventEmitter {
     let delay = 100;
 
     while (Date.now() - start < timeoutMs) {
-      if (this.proc.exitCode !== null) {
-        throw new Error("MPV a crashé avant connexion IPC");
+      if (this.terminalError || this.proc.exitCode !== null || this.proc.signalCode !== null) {
+        throw this.terminalError || new Error("MPV a crashé avant connexion IPC");
       }
 
       try {
         const socket = net.connect(this.ipcPath as any);
 
         return await new Promise<net.Socket>((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            socket.destroy();
+            reject(new Error("Timeout connexion IPC MPV"));
+          }, Math.min(500, timeoutMs - (Date.now() - start)));
           socket.once("connect", () => {
-            socket.removeAllListeners("error");
+            clearTimeout(timeout);
             resolve(socket);
           });
 
           socket.once("error", (err) => {
+            clearTimeout(timeout);
             socket.destroy();
             reject(err);
           });
@@ -396,12 +471,11 @@ async function safeSend(
   cmd: Record<string, any>,
   context: string
 ) {
-  if (!h.sock || h.sock.destroyed || !h.sock.writable) return;
-
   try {
     await h.send(cmd);
   } catch (err) {
     console.error(`[mpv] ${context} error:`, err);
+    throw err;
   }
 }
 

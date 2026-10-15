@@ -4,26 +4,31 @@ import "dotenv/config";
 import express from "express";
 import http from "http";
 import { Server as IOServer } from "socket.io";
-import path from "node:path";
-import play from "play-dl";
+import { fileURLToPath } from "node:url";
+import { playbackPosition } from "../../shared/playback.js";
+import type { DiagnosticSnapshot } from "../../shared/contracts.js";
 
 import { APP_CONFIG, MPV_CONFIG } from "./config.js";
 import { normalizeAudioProfileName } from "./audioProfiles.js";
-import { state, nextId, playing, QueueItem } from "./types.js";
+import { state, playing } from "./types.js";
+import { queueService } from "./queue.js";
+import { diagnostics, recordDiagnostic, diagnosticErrorDetails } from "./diagnostics.js";
+import { checkToolDiagnostics } from "./toolDiagnostics.js";
 import {
   ensurePlayerLoop,
   ensureMpvRunning,
   skip,
   stopPlayer,
   seekRelative,
+  seekAbsolute,
   playPrevious,
   skipGroup,
   warmUpcomingTracks,
+  getPlayerDiagnostics,
 } from "./player.js";
 import {
   mpvPause,
   mpvSetLoopFile,
-  mpvSeekAbsolute,
   mpvSetAudioProfile,
 } from "./mpv.js";
 import {
@@ -58,60 +63,26 @@ const io = new IOServer(server, {
 let systemAudioWarning: string | null = null;
 let activeUsers = 0;
 let shutdownTimer: NodeJS.Timeout | null = null;
-const SHUTDOWN_DELAY = 60_000;
+let queueRevision = 0;
+let controlTask = Promise.resolve();
 
-app.use(express.static(path.resolve(process.cwd(), "../frontend/dist")));
+app.use(express.static(fileURLToPath(new URL("../../frontend/dist/", import.meta.url))));
 
 /* --- HELPERS --- */
 
 function computePosition(now: typeof state.now): number {
-  if (!now) return 0;
-
-  if (state.control.paused || now.isBuffering || !now.startedAt) {
-    return now.positionOffsetSec ?? 0;
-  }
-
-  const current = (Date.now() - now.startedAt) / 1000;
-  const duration = now.durationSec ?? 0;
-
-  if (duration > 0 && current >= duration) {
-    return duration;
-  }
-
-  return Math.max(0, current);
+  return playbackPosition(now, state.control.paused);
 }
 
 function isProbablyUrl(input: string): boolean {
   return /^https?:\/\//i.test(input) || input.startsWith("spotify:");
 }
 
-function shuffleArray<T>(items: T[]): T[] {
-  const copy = [...items];
-
-  for (let i = copy.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [copy[i], copy[j]] = [copy[j], copy[i]];
-  }
-
-  return copy;
-}
-
 function broadcast(): void {
-  const queued = state.queue.filter((q) => q.status === "queued");
-  const totalDuration = queued.reduce(
-    (acc, item) => acc + (item.durationSec || 0),
-    0
-  );
-
   io.emit("state", {
     ok: true,
     now: state.now,
-    queue: queued,
-    history: state.history.slice(0, 200),
-    stats: {
-      totalQueued: queued.length,
-      remainingTimeSec: totalDuration,
-    },
+    ...queueService.snapshot(),
     control: state.control,
   });
 }
@@ -147,33 +118,11 @@ async function resolveSearchTextToVideoUrl(query: string): Promise<{
   durationSec?: number;
 } | null> {
   try {
-    return searchYoutubeVideo(query);
+    return await searchYoutubeVideo(query);
   } catch (err) {
     console.error("[search text resolve failed]", err);
     return null;
   }
-}
-
-function pushQueueItem(
-  item: Omit<QueueItem, "id" | "createdAt" | "status"> & {
-    status?: QueueItem["status"];
-  }
-): QueueItem {
-  const newItem: QueueItem = {
-    id: String(nextId.current++),
-    createdAt: Date.now(),
-    status: item.status || "queued",
-    url: item.url,
-    title: item.title,
-    thumb: item.thumb ?? null,
-    group: item.group,
-    addedBy: item.addedBy,
-    durationSec: item.durationSec,
-    clientRequestId: item.clientRequestId,
-  };
-
-  state.queue.push(newItem);
-  return newItem;
 }
 
 function warmQueueIfPlaying(): void {
@@ -182,23 +131,23 @@ function warmQueueIfPlaying(): void {
   }
 }
 
-/* --- INITIALISATION --- */
+function finishQueueAdd(acknowledge?: () => void, beforeStart?: () => void): void {
+  broadcast();
+  acknowledge?.();
+  warmQueueIfPlaying();
+  beforeStart?.();
+  void ensurePlayerLoop(broadcast).catch(console.error);
+}
 
-async function setupSpotify() {
-  try {
-    await play.setToken({
-      spotify: {
-        client_id: (process.env.SPOTIFY_CLIENT_ID || "").trim(),
-        client_secret: (process.env.SPOTIFY_CLIENT_SECRET || "").trim(),
-        refresh_token: (process.env.SPOTIFY_REFRESH_TOKEN || "").trim(),
-        market: "FR",
-      },
-    });
-
-    console.log("✅ [Spotify] Token configuré");
-  } catch (e) {
-    console.error("❌ [Spotify] Erreur setup:", e);
-  }
+async function refreshAudioRouting(): Promise<boolean> {
+  const ready = await ensureAudioRoutingReady();
+  const routing = getRuntimeAudioRouting();
+  systemAudioWarning = ready && isVirtualAudioRoutingReady()
+    ? null
+    : routing.message || "Le routage audio virtuel n'est pas prêt. La lecture est bloquée.";
+  recordDiagnostic(systemAudioWarning ? "AUDIO_ROUTING_UNAVAILABLE" : "AUDIO_ROUTING_READY");
+  io.emit("error_system", systemAudioWarning);
+  return systemAudioWarning === null;
 }
 
 /* --- ROUTES HTTP --- */
@@ -208,12 +157,83 @@ app.get("/health", (req, res) => {
     status: "ok",
     uptime: process.uptime(),
     activeUsers,
+    audioRouting: getRuntimeAudioRouting(),
+    playing: Boolean(playing),
+    queued: state.queue.filter((item) => item.status === "queued").length,
+    idleShutdownMs: APP_CONFIG.idleShutdownMs,
+  });
+});
+
+app.get("/diagnostics", (_req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  // Return only explicit diagnostic fields. Configuration objects include
+  // credentials and must never be serialized, even for a local server.
+  void (async () => {
+    const tools = await checkToolDiagnostics();
+    const player = getPlayerDiagnostics();
+    const audio = getRuntimeAudioRouting();
+    res.setHeader("Cache-Control", "no-store");
+    const snapshot: DiagnosticSnapshot = {
+      ok: true,
+      timestamp: new Date().toISOString(),
+      server: {
+        uptimeSec: process.uptime(), activeUsers,
+        queued: state.queue.filter((item) => item.status === "queued").length,
+        idleShutdownMs: APP_CONFIG.idleShutdownMs,
+      },
+      player: {
+        engineRunning: player.engineRunning,
+        starting: player.engineStarting,
+        loading: player.startingPlayback,
+        buffering: player.buffering,
+        paused: state.control.paused,
+        retryCount: player.retryCount,
+      },
+      audioRouting: {
+        ready: isVirtualAudioRoutingReady(),
+        degraded: audio.degraded,
+        message: audio.message,
+      },
+      tools,
+      recentEvents: diagnostics.events(),
+      logging: diagnostics.status(),
+    };
+    res.json(snapshot);
+  })().catch((error) => {
+    recordDiagnostic("DIAGNOSTICS_REQUEST_FAILED", diagnosticErrorDetails(error));
+    if (!res.headersSent) res.status(503).json({ ok: false, message: "Diagnostic temporairement indisponible." });
   });
 });
 
 /* --- LOGIQUE SOCKET --- */
 
 io.on("connection", (socket) => {
+  // EventEmitter does not await async callbacks. Contain rejected commands and
+  // malformed payloads here rather than letting them terminate the process.
+  const on = (
+    event: string,
+    handler: (payload: any) => void | Promise<void>,
+    serialized = false
+  ) => {
+    socket.on(event, (payload: unknown) => {
+      const run = async () => {
+        try {
+          await handler(payload);
+        } catch (error) {
+          recordDiagnostic("SOCKET_COMMAND_FAILED", diagnosticErrorDetails(error));
+          console.error(`[socket:${event}]`, error);
+          socket.emit("toast", "La commande a échoué. Réessaie dans un instant.");
+          broadcast();
+        }
+      };
+      if (serialized) {
+        controlTask = controlTask.then(run);
+      } else {
+        void run();
+      }
+    });
+  };
+
   activeUsers++;
   console.log(`👤 Client connecté. Total: ${activeUsers}`);
 
@@ -239,40 +259,56 @@ io.on("connection", (socket) => {
     });
   }
 
-  socket.on(
+  on(
     "play",
     async (payload: { url?: string; addedBy?: string; clientRequestId?: string }) => {
+      // Respect controls received before this add (especially a queued clear),
+      // while leaving unrelated media imports free to resolve concurrently.
+      await controlTask;
+      const revision = queueRevision;
+      const clientRequestId = typeof payload?.clientRequestId === "string"
+        ? payload.clientRequestId.trim().slice(0, 128) || undefined
+        : undefined;
+      const result = (ok: boolean, message?: string) => {
+        const detail = message?.slice(0, 500);
+        socket.emit("play_result", { clientRequestId, ok, message: detail });
+        if (!ok && detail) socket.emit("toast", detail);
+      };
+      const cancelled = () => {
+        if (revision === queueRevision && !isShuttingDown) return false;
+        result(false, "Ajout annulé : la file a été vidée.");
+        return true;
+      };
       try {
-        if (!isVirtualAudioRoutingReady()) {
-          socket.emit(
-            "toast",
-            "Lecture bloquÃ©e : le routage audio virtuel du serveur n'est pas prÃªt."
-          );
+        const raw = typeof payload?.url === "string" ? payload.url.trim() : "";
+        const addedBy = typeof payload?.addedBy === "string"
+          ? payload.addedBy.slice(0, 32) || "anon"
+          : "anon";
+
+        if (!raw || raw.length > 4096) {
+          result(false, "Entre un lien ou une recherche valide (4096 caractères maximum).");
+          return;
+        }
+
+        if (!isVirtualAudioRoutingReady() && !await refreshAudioRouting()) {
+          result(false, "Lecture bloquée : le routage audio virtuel du serveur n'est pas prêt.");
           if (systemAudioWarning) socket.emit("error_system", systemAudioWarning);
           return;
         }
-
-        const raw = String(payload?.url || "").trim();
-        const addedBy = (payload.addedBy || "anon").slice(0, 32);
-        const clientRequestId =
-          String(payload?.clientRequestId || "").trim() || undefined;
-
-        if (!raw) {
-          socket.emit("toast", "Entrée vide.");
-          return;
-        }
+        if (cancelled()) return;
 
         if (!isProbablyUrl(raw)) {
           socket.emit("toast", "Recherche YouTube en cours...");
 
           const found = await resolveSearchTextToVideoUrl(raw);
+          if (cancelled()) return;
 
           if (!found) {
-            socket.emit("toast", "Aucun résultat trouvé.");
+            result(false, "Aucun résultat trouvé.");
             return;
           }
 
-          pushQueueItem({
+          queueService.enqueue({
             url: found.url,
             title: found.title || "Titre en attente...",
             thumb: found.thumb ?? null,
@@ -281,19 +317,14 @@ io.on("connection", (socket) => {
             clientRequestId,
           });
 
-          broadcast();
-          warmQueueIfPlaying();
-          void ensurePlayerLoop(broadcast);
+          finishQueueAdd(() => result(true));
           return;
         }
 
         const normalized = normalizeUrl(raw);
 
         if (isYoutubeSearchUrl(normalized)) {
-          socket.emit(
-            "toast",
-            "Ce lien est une page de recherche YouTube, pas une vidéo."
-          );
+          result(false, "Ce lien est une page de recherche YouTube, pas une vidéo.");
           return;
         }
 
@@ -311,25 +342,14 @@ io.on("connection", (socket) => {
           );
 
           const items = await resolveUrlToPlayableItems(normalized);
+          if (cancelled()) return;
 
           if (!items.length) {
-            socket.emit("toast", "Aucun titre exploitable trouvé.");
+            result(false, "Aucun titre exploitable trouvé.");
             return;
           }
 
-          const group = items.length > 1 ? `pl_${Date.now()}` : undefined;
-
-          items.forEach((it, index) => {
-            pushQueueItem({
-              url: it.url,
-              title: it.title || "Titre en attente...",
-              thumb: it.thumb ?? null,
-              durationSec: it.durationSec || 0,
-              addedBy,
-              group,
-              clientRequestId: index === 0 ? clientRequestId : undefined,
-            });
-          });
+          queueService.enqueueCollection(items, { addedBy, clientRequestId });
 
           socket.emit(
             "toast",
@@ -337,13 +357,11 @@ io.on("connection", (socket) => {
               ? `${items.length} titres ajoutés !`
               : "Titre ajouté !"
           );
-          broadcast();
-          warmQueueIfPlaying();
-          void ensurePlayerLoop(broadcast);
+          finishQueueAdd(() => result(true));
           return;
         }
 
-        const queued = pushQueueItem({
+        const queued = queueService.enqueue({
           url: normalized,
           title: "Analyse du signal...",
           thumb: null,
@@ -351,50 +369,41 @@ io.on("connection", (socket) => {
           clientRequestId,
         });
 
-        broadcast();
-        warmQueueIfPlaying();
-
-        if (!isYoutubeSearchUrl(normalized)) {
+        finishQueueAdd(() => result(true), () => {
           void enrichQueuedItem(queued.id, normalized);
-        }
-
-        void ensurePlayerLoop(broadcast);
+        });
       } catch (e) {
         console.error("[Play Error]", e);
-        socket.emit("toast", "Erreur d'ajout.");
+        result(false, e instanceof Error ? e.message : "Erreur d'ajout.");
       }
     }
   );
 
-  socket.on("command", async (payload: { cmd: string; arg?: any }) => {
+  on("command", async (payload: { cmd?: string; arg?: unknown } | null) => {
+    if (!payload || typeof payload.cmd !== "string") {
+      throw new Error("Commande invalide");
+    }
     const h = playing?.handle;
 
     switch (payload.cmd) {
       case "pause": {
-        state.control.paused = true;
-
-        if (h) {
-          await mpvPause(h, true);
-        }
-
         if (state.now?.startedAt) {
           state.now.positionOffsetSec = computePosition(state.now);
           state.now.startedAt = null;
         }
+        state.control.paused = true;
+        if (h) await mpvPause(h, true);
         break;
       }
 
       case "resume": {
         state.control.paused = false;
 
-        if (h) {
-          await mpvPause(h, false);
-        }
-
         if (state.now && !state.now.isBuffering) {
           state.now.startedAt =
             Date.now() - ((state.now.positionOffsetSec || 0) * 1000);
         }
+        if (h) await mpvPause(h, false);
         break;
       }
 
@@ -414,29 +423,21 @@ io.on("connection", (socket) => {
       }
 
       case "seek": {
-        const delta = Number(payload.arg) || 0;
+        const delta = Number(payload.arg);
+        if (!Number.isFinite(delta)) throw new Error("Position invalide");
         await seekRelative(delta, broadcast);
         break;
       }
 
       case "seek_abs": {
-        if (h && typeof payload.arg === "number") {
-          if (state.now) {
-            state.now.positionOffsetSec = payload.arg;
-            state.now.startedAt = null;
-            state.now.isBuffering = true;
-          }
-
-          await mpvSeekAbsolute(h, payload.arg);
-          broadcast();
-        }
+        if (typeof payload.arg !== "number") throw new Error("Position invalide");
+        await seekAbsolute(payload.arg, broadcast);
         break;
       }
 
       case "repeat": {
         const isRepeat = Boolean(payload.arg);
         state.control.repeat = isRepeat;
-
         if (h) {
           await mpvSetLoopFile(h, isRepeat);
         }
@@ -446,10 +447,10 @@ io.on("connection", (socket) => {
       case "audio_profile": {
         const profile = normalizeAudioProfileName(String(payload.arg || ""));
         state.control.audioProfile = profile;
-
         if (h) {
           await mpvSetAudioProfile(h, profile);
         }
+        warmQueueIfPlaying();
 
         socket.emit(
           "toast",
@@ -467,111 +468,75 @@ io.on("connection", (socket) => {
       }
 
       case "shuffle_queue": {
-        const queuedItems = state.queue.filter((q) => q.status === "queued");
-        const shuffled = shuffleArray(queuedItems);
-        const completed = state.queue.filter((q) => q.status !== "queued");
-        state.queue = [...completed, ...shuffled];
+        queueService.shuffle();
         warmQueueIfPlaying();
         break;
       }
+      default:
+        throw new Error("Commande inconnue");
     }
 
     broadcast();
-  });
+  }, true);
 
-  socket.on("clear", async () => {
-    state.queue.forEach((q) => {
-      if (q.status === "queued" || q.status === "playing") {
-        q.status = "done";
-      }
-    });
+  on("clear", async () => {
+    queueRevision++;
+    queueService.clear();
 
     await stopPlayer(broadcast);
     broadcast();
-  });
+  }, true);
 
-  socket.on("remove_queue_item", async ({ id }: { id: string }) => {
-    const item = state.queue.find((q) => q.id === id);
-    if (!item) return;
+  on("remove_queue_item", async (payload: { id?: string } | null) => {
+    const id = payload?.id;
+    if (typeof id !== "string") throw new Error("Identifiant invalide");
+    const removed = queueService.remove(id);
+    if (removed === "missing") return;
 
-    item.status = "done";
-
-    if (playing && playing.item.id === id) {
+    if (removed === "playing") {
       await skip(broadcast);
     } else {
       warmQueueIfPlaying();
       broadcast();
     }
-  });
+  }, true);
 
-  socket.on("reorder_queue", ({ ids }: { ids: string[] }) => {
-    const queuedItems = state.queue.filter((q) => q.status === "queued");
-
-    const reordered: QueueItem[] = ids
-      .map((id) => queuedItems.find((item) => item.id === id))
-      .filter((item): item is QueueItem => Boolean(item));
-
-    const remaining = queuedItems.filter((q) => !ids.includes(q.id));
-    const completed = state.queue.filter((q) => q.status !== "queued");
-
-    state.queue = [...completed, ...reordered, ...remaining];
+  on("reorder_queue", (payload: { ids?: unknown } | null) => {
+    if (!Array.isArray(payload?.ids) || !payload.ids.every((id) => typeof id === "string")) {
+      throw new Error("Ordre de file invalide");
+    }
+    queueService.reorder(payload.ids as string[]);
     warmQueueIfPlaying();
     broadcast();
-  });
+  }, true);
 
-  socket.on(
+  on(
     "requeue_history_item",
-    ({ id, targetIndex }: { id: string; targetIndex?: number }) => {
-      const source = state.history.find((h) => h.id === id);
-      if (!source) return;
-
-      const newItem = pushQueueItem({
-        url: source.url,
-        title: source.title || "Titre en attente...",
-        thumb: source.thumb ?? null,
-        durationSec: source.durationSec || 0,
-        addedBy: source.addedBy,
-        group: source.group,
-      });
-
-      const queuedItems = state.queue.filter((q) => q.status === "queued");
-      const completed = state.queue.filter((q) => q.status !== "queued");
-
-      const queueOnly = queuedItems.filter((q) => q.id !== newItem.id);
-
-      const insertAt =
-        typeof targetIndex === "number"
-          ? Math.max(0, Math.min(targetIndex, queueOnly.length))
-          : queueOnly.length;
-
-      queueOnly.splice(insertAt, 0, newItem);
-
-      state.queue = [...completed, ...queueOnly];
-
-      broadcast();
-      warmQueueIfPlaying();
-      void ensurePlayerLoop(broadcast);
-    }
+    async (payload: { id?: string; targetIndex?: number } | null) => {
+      const { id, targetIndex } = payload || {};
+      if (typeof id !== "string") throw new Error("Identifiant invalide");
+      if (!isVirtualAudioRoutingReady() && !await refreshAudioRouting()) {
+        socket.emit("toast", systemAudioWarning);
+        return;
+      }
+      if (!queueService.requeueHistory(id, targetIndex)) return;
+      finishQueueAdd();
+    },
+    true
   );
 
   socket.on("disconnect", () => {
-    activeUsers--;
+    activeUsers = Math.max(0, activeUsers - 1);
     console.log(`👤 Client déconnecté. Restants: ${activeUsers}`);
 
-    if (activeUsers <= 0) {
+    if (activeUsers === 0 && APP_CONFIG.idleShutdownMs > 0) {
       console.log(
-        `⏳ Plus personne sur l'interface. Extinction dans ${SHUTDOWN_DELAY / 1000}s...`
+        `⏳ Plus personne sur l'interface. Extinction dans ${APP_CONFIG.idleShutdownMs / 1000}s...`
       );
 
-      shutdownTimer = setTimeout(async () => {
-        console.log("🔌 Auto-shutdown : Inactivité prolongée.");
-
-        try {
-          await stopPlayer(broadcast);
-        } catch {}
-
-        process.exit(0);
-      }, SHUTDOWN_DELAY);
+      shutdownTimer = setTimeout(() => {
+        if (activeUsers === 0) void shutdown("inactivité");
+      }, APP_CONFIG.idleShutdownMs);
     }
   });
 });
@@ -581,8 +546,13 @@ let isShuttingDown = false;
 async function shutdown(signal: string): Promise<void> {
   if (isShuttingDown) return;
   isShuttingDown = true;
+  queueRevision++;
+  if (shutdownTimer) clearTimeout(shutdownTimer);
+  const exitCode = Number(process.exitCode) || 0;
+  setTimeout(() => process.exit(exitCode), 3_000).unref();
 
   console.log(`[server] ${signal} received, stopping player`);
+  recordDiagnostic("SERVER_STOPPING");
 
   try {
     await stopPlayer(broadcast);
@@ -590,8 +560,8 @@ async function shutdown(signal: string): Promise<void> {
     console.warn("[server] player shutdown failed", error);
   }
 
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 3_000).unref();
+  await diagnostics.flush();
+  io.close(() => process.exit(exitCode));
 }
 
 process.once("SIGINT", () => void shutdown("SIGINT"));
@@ -600,33 +570,37 @@ process.once("SIGTERM", () => void shutdown("SIGTERM"));
 /* --- BOOTSTRAP --- */
 
 async function bootstrap() {
+  await diagnostics.initialize();
   state.control.audioProfile = MPV_CONFIG.defaultAudioProfile;
 
-  await setupSpotify();
-
-  const audioReady = await ensureAudioRoutingReady();
+  const audioReady = await refreshAudioRouting();
   const audioRouting = getRuntimeAudioRouting();
 
   if (audioRouting.message) {
     console.log(`[Audio] ${audioRouting.message}`);
   }
 
-  if (!audioReady || !isVirtualAudioRoutingReady()) {
-    systemAudioWarning =
-      audioRouting.message ||
-      "Le routage audio virtuel n'a pas pu être préparé. Le bot utilisera la sortie audio système par défaut.";
-  }
-
-  if (systemAudioWarning) {
-    systemAudioWarning =
-      "Le routage audio virtuel n'est pas prÃªt. La lecture est bloquÃ©e pour Ã©viter toute sortie audio systÃ¨me.";
-  } else {
+  if (audioReady) {
     ensureMpvRunning().catch(console.error);
   }
 
   server.listen(APP_CONFIG.PORT, () => {
+    recordDiagnostic("SERVER_STARTED");
+    void checkToolDiagnostics().catch(() => recordDiagnostic("TOOL_CHECK_WARNING"));
     console.log(`🚀 Server Ready on port ${APP_CONFIG.PORT}`);
   });
 }
 
-bootstrap();
+server.on("error", (error) => {
+  recordDiagnostic("SERVER_START_FAILED", diagnosticErrorDetails(error));
+  console.error("[server] HTTP server failed", error);
+  process.exitCode = 1;
+  void shutdown("erreur HTTP");
+});
+
+bootstrap().catch((error) => {
+  recordDiagnostic("SERVER_START_FAILED", diagnosticErrorDetails(error));
+  console.error("[server] Startup failed", error);
+  process.exitCode = 1;
+  void shutdown("erreur de démarrage");
+});

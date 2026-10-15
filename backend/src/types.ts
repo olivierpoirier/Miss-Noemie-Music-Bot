@@ -1,6 +1,15 @@
 import { ChildProcess } from "child_process";
 import net from "net";
-import type { AudioProfileName } from "./audioProfiles.js";
+import type { GlobalState, QueueItem } from "../../shared/contracts.js";
+export type {
+  AudioProfileName,
+  Command,
+  Control,
+  GlobalState,
+  Now,
+  QueueItem,
+  QueueResponse,
+} from "../../shared/contracts.js";
 
 /* ------------------- MPV TYPES ------------------- */
 
@@ -25,49 +34,6 @@ export interface MpvHandle {
   removeListener(listener: (ev: MpvEvent) => void): void;
 
   kill(): void;
-}
-
-/* ------------------- STATE TYPES ------------------- */
-
-export type Control = {
-  paused: boolean;
-  skipSeq: number;
-  repeat: boolean;
-  randomMode: boolean;
-  audioProfile: AudioProfileName;
-};
-
-export type Now = {
-  url?: string;
-  title?: string;
-  thumb?: string | null;
-  addedBy?: string;
-  startedAt?: number | null;
-  group?: string;
-  durationSec?: number | null;
-  positionOffsetSec?: number;
-  isBuffering: boolean;
-  clientRequestId?: string;
-};
-
-export type QueueItem = {
-  id: string;
-  url: string;
-  title?: string;
-  thumb: string | null;
-  group?: string;
-  addedBy?: string;
-  status: "queued" | "playing" | "done" | "error" | "pending";
-  createdAt: number;
-  durationSec?: number;
-  clientRequestId?: string;
-};
-
-export interface GlobalState {
-  control: Control;
-  now: Now | null;
-  queue: QueueItem[];
-  history: QueueItem[];
 }
 
 /* ------------------- STATE INSTANCE ------------------- */

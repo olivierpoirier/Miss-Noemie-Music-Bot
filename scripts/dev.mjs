@@ -10,7 +10,9 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const withTunnel = process.argv.includes("--tunnel");
 const checkOnly = process.argv.includes("--check");
 const isWindows = process.platform === "win32";
+const backendPort = Number(process.env.PORT || 4000);
 
+// Retain exited parents too: descendants may still belong to their group.
 const children = new Set();
 let shuttingDown = false;
 
@@ -29,9 +31,11 @@ function startProcess(label, command, args, cwd) {
     env: {
       ...process.env,
       FORCE_COLOR: process.env.FORCE_COLOR || "1",
+      XMB_BACKEND_PORT: String(backendPort),
     },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: false,
+    detached: !isWindows,
   });
 
   children.add(child);
@@ -45,19 +49,10 @@ function startProcess(label, command, args, cwd) {
   });
 
   child.on("exit", (code, signal) => {
-    children.delete(child);
     if (shuttingDown) return;
 
-    if (code && code !== 0) {
-      console.error(`[${label}] exited with code ${code}`);
-      shutdown(code);
-      return;
-    }
-
-    if (signal) {
-      console.error(`[${label}] stopped by ${signal}`);
-      shutdown(1);
-    }
+    console.error(`[${label}] ${signal ? `stopped by ${signal}` : `exited with code ${code}`}`);
+    shutdown(code || 1);
   });
 
   return child;
@@ -67,7 +62,7 @@ function requestOk(url) {
   return new Promise((resolve) => {
     const req = http.get(url, (res) => {
       res.resume();
-      resolve(res.statusCode >= 200 && res.statusCode < 500);
+      resolve(res.statusCode >= 200 && res.statusCode < 300);
     });
 
     req.on("error", () => resolve(false));
@@ -121,7 +116,7 @@ async function findAvailablePort(startPort, maxAttempts = 40) {
   );
 }
 
-function killTree(child) {
+function killTree(child, signal = "SIGTERM") {
   if (!child.pid) return;
 
   if (isWindows) {
@@ -132,24 +127,43 @@ function killTree(child) {
     return;
   }
 
-  child.kill("SIGTERM");
+  // tsx watch and Vite can create descendants. Killing their direct parent
+  // alone leaves stale servers holding ports after Ctrl+C or a failed startup.
+  try {
+    process.kill(-child.pid, signal);
+  } catch (error) {
+    if (error.code !== "ESRCH") child.kill(signal);
+  }
 }
 
 function shutdown(code = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
 
-  for (const child of children) {
+  const processes = [...children];
+  if (processes.length === 0) process.exit(code);
+  for (const child of processes) {
     killTree(child);
   }
 
-  setTimeout(() => process.exit(code), 250);
+  // Give the backend time to stop mpv and release audio routing before forcing
+  // down any descendants that ignore SIGTERM.
+  setTimeout(() => {
+    if (!isWindows) {
+      for (const child of processes) killTree(child, "SIGKILL");
+    }
+    process.exit(code);
+  }, 5000);
 }
 
 process.once("SIGINT", () => shutdown(0));
 process.once("SIGTERM", () => shutdown(0));
 
 async function main() {
+  if (!Number.isInteger(backendPort) || backendPort < 1 || backendPort > 65535) {
+    throw new Error("PORT doit etre un entier entre 1 et 65535.");
+  }
+
   if (checkOnly) {
     const requiredFiles = [
       "backend/node_modules/tsx/dist/cli.mjs",
@@ -167,6 +181,10 @@ async function main() {
     return;
   }
 
+  if (!await canListen(backendPort)) {
+    throw new Error(`Le port backend ${backendPort} est deja utilise. Arrete le serveur existant ou choisis un autre PORT.`);
+  }
+
   console.log("[dev] Demarrage du backend local...");
   startProcess(
     "backend",
@@ -175,7 +193,7 @@ async function main() {
     path.join(rootDir, "backend")
   );
 
-  await waitFor("http://127.0.0.1:4000/health", "backend");
+  await waitFor(`http://127.0.0.1:${backendPort}/health`, "backend");
 
   const frontendPort = await findAvailablePort(5173);
   console.log("[dev] Demarrage du frontend local...");

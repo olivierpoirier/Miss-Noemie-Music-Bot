@@ -9,6 +9,7 @@
     "build": "tsc -b && vite build",
     "build:vercel": "tsc -b && vite build --mode vercel",
     "lint": "eslint .",
+    "test": "node --test test/*.test.cjs",
     "preview": "vite preview",
     "start": "vite"
   },

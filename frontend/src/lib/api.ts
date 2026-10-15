@@ -1,7 +1,7 @@
 export const API_BASE = import.meta.env.VITE_API_BASE || "";
 
 
-/** Extrait la première URL plausible d’un texte, sinon renvoie le 1er mot trim */
+/** Extrait une URL plausible, sinon conserve la recherche entière. */
 export const pickUrlLike = (raw: string): string => {
   const t = (raw || "").trim();
   const m = t.match(/https?:\/\/[^\s<>"']+/i);
@@ -15,5 +15,5 @@ export const pickUrlLike = (raw: string): string => {
   ) {
     return `https://${first}`;
   }
-  return first;
+  return t;
 };

@@ -11,7 +11,8 @@ type EmbedOptions = {
 
 function parseUrl(value: string): URL | null {
   try {
-    return new URL(value);
+    const url = new URL(value);
+    return ["http:", "https:"].includes(url.protocol) ? url : null;
   } catch {
     return null;
   }
@@ -74,9 +75,19 @@ function twitchEmbed(
     muted: muted ? "true" : "false",
   });
 
-  if (host === "clips.twitch.tv" && parts[0]) {
-    params.set("clip", parts[0]);
-  } else if (parts[0] === "videos" && parts[1]) {
+  const clip = host === "clips.twitch.tv"
+    ? (parts[0] === "embed" ? url.searchParams.get("clip") : parts[0])
+    : parts[1] === "clip" ? parts[2] : null;
+
+  if (clip) {
+    params.set("clip", clip);
+    return {
+      provider: "twitch",
+      label: "Twitch",
+      src: `https://clips.twitch.tv/embed?${params}`,
+    };
+  }
+  if (parts[0] === "videos" && parts[1]) {
     params.set("video", parts[1]);
   } else if (parts[0]) {
     params.set("channel", parts[0]);

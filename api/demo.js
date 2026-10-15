@@ -1,3 +1,8 @@
+let playbackPosition, clampPlaybackPosition, playbackClockAt;
+const clockReady = import("../shared/playback.js").then((clock) => {
+  ({ playbackPosition, clampPlaybackPosition, playbackClockAt } = clock);
+});
+
 const STORE_KEY = "__music_bot_vercel_demo_state__";
 
 const DEFAULT_CONTROL = {
@@ -20,6 +25,7 @@ const DEMO_PLAYLIST_MAX_ITEMS = 50;
 const DEMO_FETCH_TIMEOUT_MS = 5500;
 const RECENT_REQUEST_LIMIT = 80;
 const RECENT_ADD_WINDOW_MS = 3500;
+const BODY_LIMIT_BYTES = 64 * 1024;
 
 function createStore() {
   return {
@@ -32,6 +38,7 @@ function createStore() {
     pendingClientRequests: [],
     pendingAdds: [],
     recentAdds: [],
+    generation: 0,
   };
 }
 
@@ -77,6 +84,18 @@ function safeUrl(value) {
   }
 }
 
+function hasDomain(host, domain) {
+  return host === domain || host.endsWith(`.${domain}`);
+}
+
+function decodeText(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 function youtubeId(url) {
   const host = url.hostname.replace(/^www\./, "");
 
@@ -84,7 +103,7 @@ function youtubeId(url) {
     return url.pathname.split("/").filter(Boolean)[0] || null;
   }
 
-  if (host.endsWith("youtube.com")) {
+  if (hasDomain(host, "youtube.com")) {
     return url.searchParams.get("v");
   }
 
@@ -96,13 +115,13 @@ function titleFromUrl(url, fallback) {
   const query = url.searchParams.get("search_query");
 
   if (query) {
-    return decodeURIComponent(query.replace(/\+/g, " "));
+    return query;
   }
 
   const segments = url.pathname
     .split("/")
     .filter(Boolean)
-    .map((segment) => decodeURIComponent(segment.replace(/[-_]+/g, " ")));
+    .map((segment) => decodeText(segment).replace(/[-_]+/g, " "));
 
   const label = segments.at(-1) || host;
   const cleaned = label.replace(/\.[a-z0-9]{2,5}$/i, "").trim();
@@ -183,7 +202,7 @@ function bestThumbnailUrl(thumbnails) {
 function playlistIdFromUrl(url) {
   const host = url.hostname.replace(/^www\./, "");
 
-  if (!host.includes("youtube.com") && host !== "youtu.be") {
+  if (!hasDomain(host, "youtube.com") && host !== "youtu.be") {
     return null;
   }
 
@@ -197,7 +216,7 @@ function youtubePlaylistItemUrl(videoId, playlistId) {
   return url.toString();
 }
 
-async function fetchWithTimeout(url, options = {}) {
+async function fetchWithTimeout(url, options, readResponse) {
   if (typeof fetch !== "function") {
     throw new Error("fetch unavailable");
   }
@@ -224,7 +243,8 @@ async function fetchWithTimeout(url, options = {}) {
       throw new Error(`fetch failed with ${response.status}`);
     }
 
-    return response;
+    // Keep the deadline active while reading the body, not only until headers.
+    return await readResponse(response);
   } finally {
     if (timeoutId) {
       clearTimeout(timeoutId);
@@ -233,15 +253,13 @@ async function fetchWithTimeout(url, options = {}) {
 }
 
 async function fetchJson(url) {
-  const response = await fetchWithTimeout(url, {
+  return fetchWithTimeout(url, {
     headers: { accept: "application/json" },
-  });
-  return response.json();
+  }, (response) => response.json());
 }
 
 async function fetchText(url) {
-  const response = await fetchWithTimeout(url);
-  return response.text();
+  return fetchWithTimeout(url, {}, (response) => response.text());
 }
 
 function extractJsonObjectAfter(html, marker) {
@@ -391,18 +409,18 @@ function oEmbedEndpointsForUrl(url) {
   const encoded = encodeURIComponent(url.toString());
   const noembed = `https://noembed.com/embed?url=${encoded}`;
 
-  if (host.includes("youtube.com") || host === "youtu.be") {
+  if (hasDomain(host, "youtube.com") || host === "youtu.be") {
     return [
       `https://www.youtube.com/oembed?url=${encoded}&format=json`,
       noembed,
     ];
   }
 
-  if (host.includes("spotify.com")) {
+  if (hasDomain(host, "spotify.com")) {
     return [`https://open.spotify.com/oembed?url=${encoded}`, noembed];
   }
 
-  if (host.includes("soundcloud.com")) {
+  if (hasDomain(host, "soundcloud.com")) {
     return [
       `https://soundcloud.com/oembed?format=json&url=${encoded}`,
       noembed,
@@ -504,14 +522,8 @@ function buildQueueItem(resolved, addedBy, clientRequestId, index, group) {
 }
 
 function computePosition(store) {
-  const now = store.now;
-  if (!now) return 0;
-
-  if (store.control.paused || now.isBuffering || !now.startedAt) {
-    return now.positionOffsetSec || 0;
-  }
-
-  return Math.max(0, (Date.now() - now.startedAt) / 1000);
+  // The demo carries overflow across tracks after browser suspension.
+  return playbackPosition(store.now, store.control.paused, Date.now(), false);
 }
 
 function pushHistory(store, item) {
@@ -532,14 +544,16 @@ function startItem(store, item) {
   store.now = {
     ...item,
     status: undefined,
-    startedAt: Date.now(),
-    positionOffsetSec: 0,
+    ...playbackClockAt(0, store.control.paused),
     isBuffering: false,
   };
 }
 
 function startNext(store) {
-  const next = store.queue.shift();
+  const index = store.control.randomMode
+    ? Math.floor(Math.random() * store.queue.length)
+    : 0;
+  const [next] = store.queue.splice(index, 1);
 
   if (next) {
     startItem(store, next);
@@ -549,23 +563,25 @@ function startNext(store) {
 }
 
 function syncPlayback(store) {
-  const now = store.now;
-  if (!now || store.control.paused || now.isBuffering) return;
+  while (store.now && !store.control.paused && !store.now.isBuffering) {
+    const duration = store.now.durationSec || 0;
+    const position = computePosition(store);
+    if (!duration || position < duration) return;
 
-  const duration = now.durationSec || 0;
-  if (!duration) return;
+    const overflow = position - duration;
+    if (store.control.repeat) {
+      seekTo(store, position % duration);
+      return;
+    }
 
-  const position = computePosition(store);
-  if (position < duration) return;
-
-  if (store.control.repeat) {
-    now.startedAt = Date.now();
-    now.positionOffsetSec = 0;
-    return;
+    pushHistory(store, store.now);
+    startNext(store);
+    // A demo browser may be suspended for several songs. Carry the elapsed
+    // time across the queue instead of restarting at the next song on return.
+    if (store.now) {
+      store.now.startedAt -= overflow * 1000;
+    }
   }
-
-  pushHistory(store, now);
-  startNext(store);
 }
 
 function statePayload(store) {
@@ -704,9 +720,15 @@ async function addQueueItems(store, raw, addedBy, clientRequestId) {
 
   const requestKey = markClientRequestPending(store, clientRequestId);
   const addKey = markAddPending(store, raw, addedBy);
+  const generation = store.generation;
 
   try {
     const resolvedItems = await resolveDemoItems(raw);
+    if (generation !== store.generation) {
+      clearPendingAdd(store, addKey);
+      clearPendingClientRequest(store, requestKey);
+      return { count: 0, cancelled: true };
+    }
     const group =
       resolvedItems.length > 1
         ? `demo_${Date.now()}_${hashString(String(raw || ""))}`
@@ -761,34 +783,25 @@ function shuffle(items) {
 function seekTo(store, positionSec) {
   if (!store.now) return;
 
-  const duration = store.now.durationSec || 0;
-  const position = Math.max(
-    0,
-    duration ? Math.min(Number(positionSec) || 0, duration) : Number(positionSec) || 0
-  );
-
-  store.now.positionOffsetSec = position;
-  store.now.startedAt = store.control.paused
-    ? null
-    : Date.now() - position * 1000;
+  const position = clampPlaybackPosition(Number(positionSec), store.now.durationSec);
+  Object.assign(store.now, playbackClockAt(position, store.control.paused || store.now.isBuffering));
 }
 
 function handleCommand(store, cmd, arg) {
   switch (cmd) {
     case "pause": {
       if (store.now) {
-        store.now.positionOffsetSec = computePosition(store);
-        store.now.startedAt = null;
+        Object.assign(store.now, playbackClockAt(computePosition(store), true));
       }
       store.control.paused = true;
       break;
     }
 
     case "resume": {
+      if (!store.control.paused) break;
       store.control.paused = false;
       if (store.now) {
-        const offset = store.now.positionOffsetSec || 0;
-        store.now.startedAt = Date.now() - offset * 1000;
+        Object.assign(store.now, playbackClockAt(store.now.positionOffsetSec, store.now.isBuffering));
       }
       break;
     }
@@ -801,13 +814,18 @@ function handleCommand(store, cmd, arg) {
     }
 
     case "skip_group": {
-      store.queue = [];
+      const group = store.now?.group;
+      if (group) store.queue = store.queue.filter((item) => item.group !== group);
       pushHistory(store, store.now);
-      store.now = null;
+      startNext(store);
       break;
     }
 
     case "previous": {
+      if (store.now && computePosition(store) > 5) {
+        seekTo(store, 0);
+        break;
+      }
       const previous = store.history.shift();
       if (!previous) break;
 
@@ -870,22 +888,34 @@ function handleCommand(store, cmd, arg) {
 }
 
 async function readBody(req) {
+  let body;
   if (req.body) {
-    return typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    if (typeof req.body === "string" && Buffer.byteLength(req.body) > BODY_LIMIT_BYTES) {
+      throw Object.assign(new Error("Requête trop volumineuse."), { status: 413 });
+    }
+    body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+  } else {
+    let raw = "";
+    let bytes = 0;
+    for await (const chunk of req) {
+      bytes += Buffer.byteLength(chunk);
+      if (bytes > BODY_LIMIT_BYTES) {
+        throw Object.assign(new Error("Requête trop volumineuse."), { status: 413 });
+      }
+      raw += chunk;
+    }
+    body = raw ? JSON.parse(raw) : {};
   }
-
-  let raw = "";
-
-  for await (const chunk of req) {
-    raw += chunk;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw Object.assign(new Error("Corps de requête invalide."), { status: 400 });
   }
-
-  return raw ? JSON.parse(raw) : {};
+  return body;
 }
 
 function send(res, status, body) {
   res.statusCode = status;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -893,6 +923,7 @@ function send(res, status, body) {
 }
 
 async function handler(req, res) {
+  await clockReady;
   if (req.method === "OPTIONS") {
     send(res, 204, {});
     return;
@@ -903,6 +934,7 @@ async function handler(req, res) {
   const action = url.searchParams.get("action") || "state";
 
   try {
+    syncPlayback(store);
     if (action === "state") {
       send(res, 200, { ok: true, state: statePayload(store) });
       return;
@@ -922,7 +954,7 @@ async function handler(req, res) {
 
     switch (action) {
       case "play": {
-        const raw = String(body.url || "").trim();
+        const raw = String(body.url || "").trim().slice(0, 4096);
         if (!raw) {
           toast = "Entrée vide.";
           break;
@@ -938,6 +970,10 @@ async function handler(req, res) {
           toast = "Ajout deja traite.";
           break;
         }
+        if (result.cancelled) {
+          toast = "Ajout annulé.";
+          break;
+        }
 
         const count = result.count;
         toast = count > 1 ? `${count} titres ajoutés !` : "Titre ajouté !";
@@ -950,6 +986,7 @@ async function handler(req, res) {
       }
 
       case "clear": {
+        store.generation += 1;
         store.queue = [];
         pushHistory(store, store.now);
         store.now = null;
@@ -963,7 +1000,7 @@ async function handler(req, res) {
       }
 
       case "reorder_queue": {
-        const ids = Array.isArray(body.ids) ? body.ids.map(String) : [];
+        const ids = Array.isArray(body.ids) ? [...new Set(body.ids.map(String))] : [];
         const byId = new Map(store.queue.map((item) => [item.id, item]));
         const ordered = ids.map((id) => byId.get(id)).filter(Boolean);
         const remaining = store.queue.filter((item) => !ids.includes(item.id));
@@ -990,8 +1027,8 @@ async function handler(req, res) {
           startItem(store, item);
         } else {
           const targetIndex =
-            typeof body.targetIndex === "number"
-              ? Math.max(0, Math.min(body.targetIndex, store.queue.length))
+            Number.isFinite(body.targetIndex)
+              ? Math.max(0, Math.min(Math.trunc(body.targetIndex), store.queue.length))
               : store.queue.length;
           store.queue.splice(targetIndex, 0, item);
         }
@@ -1005,10 +1042,11 @@ async function handler(req, res) {
 
     send(res, 200, { ok: true, state: statePayload(store), toast });
   } catch (error) {
-    send(res, 500, {
+    const status = error.status || (error instanceof SyntaxError ? 400 : 500);
+    send(res, status, {
       ok: false,
       state: statePayload(store),
-      toast: "Erreur du serveur demo.",
+      toast: status < 500 ? error.message : "Erreur du serveur demo.",
     });
   }
 }

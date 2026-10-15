@@ -1,5 +1,6 @@
 import { spawn } from "child_process";
 import play from "play-dl";
+import { recordDiagnostic, diagnosticErrorDetails } from "./diagnostics.js";
 import { resolveSpotifyUrl, SpotifyResolverError } from "./spotify.js";
 
 import { YTDLP_CONFIG } from "./config.js";
@@ -40,10 +41,28 @@ export type PlayableSource = {
   ext?: string;
   formatId?: string;
   protocol?: string;
+  expiresAt?: number;
 };
 
 const DIRECT_CACHE = new Map<string, CacheVal<PlayableSource>>();
+const DIRECT_PENDING = new Map<string, Promise<PlayableSource | null>>();
 const FLAT_CACHE = new Map<string, CacheVal<ResolvedItem[]>>();
+
+const PLAY_DL_TIMEOUT_MS = 10_000;
+
+async function withDeadline<T>(operation: Promise<T>, label: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${label} timeout`)), PLAY_DL_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 function cacheGet<K, V>(map: Map<K, CacheVal<V>>, key: K): V | undefined {
   const val = map.get(key);
@@ -57,7 +76,7 @@ function cacheGet<K, V>(map: Map<K, CacheVal<V>>, key: K): V | undefined {
   return val.v;
 }
 
-function cacheSet<K, V>(map: Map<K, CacheVal<V>>, key: K, value: V): void {
+function cacheSet<K, V>(map: Map<K, CacheVal<V>>, key: K, value: V, expiresAt?: number): void {
   if (map.size >= YTDLP_CONFIG.cacheMax) {
     const first = map.keys().next();
     if (!first.done) map.delete(first.value);
@@ -65,7 +84,7 @@ function cacheSet<K, V>(map: Map<K, CacheVal<V>>, key: K, value: V): void {
 
   map.set(key, {
     v: value,
-    exp: Date.now() + YTDLP_CONFIG.cacheTTL,
+    exp: expiresAt ?? Date.now() + YTDLP_CONFIG.cacheTTL,
   });
 }
 
@@ -93,10 +112,9 @@ function buildYtDlpArgs(
     isYoutubeUrl(url) &&
     !isYoutubeSearchUrl(url);
 
-  const youtubePlayerClient =
-    opts && "youtubePlayerClient" in opts
-      ? opts.youtubePlayerClient
-      : YTDLP_CONFIG.youtubePlayerClients;
+  const youtubePlayerClient = opts?.youtubePlayerClient === undefined
+    ? YTDLP_CONFIG.youtubePlayerClients
+    : opts.youtubePlayerClient;
 
   if (isYoutubeUrl(url) && youtubePlayerClient) {
     args.push(
@@ -120,7 +138,11 @@ function killProcessTree(proc: ReturnType<typeof spawn>) {
       spawn("taskkill", ["/pid", String(proc.pid), "/f", "/t"], {
         stdio: "ignore",
         windowsHide: true,
-      });
+      }).on("error", () => {});
+    } else if (proc.pid) {
+      // The runner starts a separate group, including JS runtimes/helpers.
+      try { process.kill(-proc.pid, "SIGKILL"); }
+      catch { proc.kill("SIGKILL"); }
     } else {
       proc.kill("SIGKILL");
     }
@@ -350,10 +372,10 @@ export async function searchYoutubeVideo(
   if (!trimmed) return null;
 
   try {
-    const results = await play.search(trimmed, {
+    const results = await withDeadline(play.search(trimmed, {
       limit: 1,
       source: { youtube: "video" },
-    });
+    }), "YouTube search");
 
     const item = mapYoutubeSearchResult(results[0], trimmed);
     if (item) return item;
@@ -424,11 +446,15 @@ async function resolveYoutubePlaylistFast(
   if (!isYoutubeUrl(normalized) || !isPlaylistUrl(normalized)) return null;
 
   try {
-    const playlist = await play.playlist_info(normalized, {
+    const videos = await withDeadline((async () => {
+      const playlist = await play.playlist_info(normalized, {
       incomplete: true,
-    });
+      });
 
-    const videos = await playlist.all_videos();
+      // all_videos() fetched an entire large playlist before the 200-item cap.
+      if (playlist.total_videos < 200) await playlist.fetch(200 - playlist.total_videos);
+      return Array.from({ length: playlist.total_pages }, (_, page) => playlist.page(page + 1)).flat();
+    })(), "YouTube playlist");
 
     const items = videos
       .map((video: any) => {
@@ -474,9 +500,10 @@ async function resolveYoutubePlaylistFast(
 async function runYtDlp(
   url: string,
   extraArgs: string[],
-  opts?: { useCookies?: boolean; youtubePlayerClient?: string | null }
+  opts?: { useCookies?: boolean; youtubePlayerClient?: string | null; timeoutMs?: number }
 ): Promise<string> {
   const finalArgs = buildYtDlpArgs(url, extraArgs, opts);
+  const startedAt = Date.now();
 
   return new Promise((resolve, reject) => {
     console.log(`[yt-dlp] ${YTDLP_CONFIG.bin} ${finalArgs.join(" ")}`);
@@ -484,6 +511,7 @@ async function runYtDlp(
     const proc = spawn(YTDLP_CONFIG.bin, finalArgs, {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
+      detached: process.platform !== "win32",
     });
 
     let out = "";
@@ -495,26 +523,36 @@ async function runYtDlp(
       finished = true;
 
       killProcessTree(proc);
+      recordDiagnostic("YTDLP_TIMEOUT", { durationMs: Date.now() - startedAt, reason: "timeout" });
 
       if (err.trim()) {
         console.error("[yt-dlp timeout stderr]", err);
       }
 
       reject(new Error("yt-dlp timeout"));
-    }, YTDLP_CONFIG.processTimeoutMs);
+    }, opts?.timeoutMs ?? YTDLP_CONFIG.processTimeoutMs);
 
     proc.stdout.on("data", (d) => {
+      if (finished) return;
       out += d.toString();
+      if (out.length > 32 * 1024 * 1024) {
+        finished = true;
+        clearTimeout(timeout);
+        killProcessTree(proc);
+        recordDiagnostic("YTDLP_PROCESS_FAILED", { durationMs: Date.now() - startedAt });
+        reject(new Error("yt-dlp output exceeded 32 MiB"));
+      }
     });
 
     proc.stderr.on("data", (d) => {
-      err += d.toString();
+      if (!finished) err = (err + d.toString()).slice(-65_536);
     });
 
     proc.on("error", (spawnErr) => {
       if (finished) return;
       finished = true;
       clearTimeout(timeout);
+      recordDiagnostic("YTDLP_PROCESS_FAILED", { ...diagnosticErrorDetails(spawnErr), durationMs: Date.now() - startedAt });
       reject(spawnErr);
     });
 
@@ -526,6 +564,7 @@ async function runYtDlp(
       if (code === 0) {
         resolve(out.trim());
       } else {
+        recordDiagnostic("YTDLP_PROCESS_FAILED", { ...diagnosticErrorDetails(new Error(err)), durationMs: Date.now() - startedAt });
         if (err.trim()) {
           console.error("[yt-dlp error]", err);
         }
@@ -669,9 +708,11 @@ export async function probeSingle(url: string): Promise<ProbeResult> {
 
   if (isDirectMediaUrl(normalized)) {
     const name = normalized.split("/").pop()?.split("?")[0] || "Audio direct";
+    let title = name;
+    try { title = decodeURIComponent(name); } catch {}
 
     const res: ProbeResult = {
-      title: decodeURIComponent(name),
+      title,
       thumb: buildFallbackThumb(name, normalized),
       durationSec: 0,
     };
@@ -682,7 +723,7 @@ export async function probeSingle(url: string): Promise<ProbeResult> {
 
   if (play.yt_validate(normalized) === "video") {
     try {
-      const info = await play.video_info(normalized);
+      const info = await withDeadline(play.video_info(normalized), "YouTube metadata");
 
       const res: ProbeResult = {
         title: info.video_details.title || "YouTube",
@@ -760,32 +801,34 @@ function sourceFromYtDlpJson(
   data: any,
   debugLabel?: string
 ): PlayableSource | null {
-  const requested = data?.requested_downloads?.[0];
-  const requestedFormat = data?.requested_formats?.[0];
+  const candidates = [
+    ...(data?.requested_formats || []),
+    ...(data?.requested_downloads || []),
+    data,
+  ].filter((format) => typeof format?.url === "string" && /^https?:\/\//i.test(format.url));
+  // A custom selector can return separate video/audio formats. The first
+  // requested format is often video-only and would leave MPV silent.
+  const selected = candidates.find((format) => format.vcodec === "none" && format.acodec && format.acodec !== "none")
+    || candidates.find((format) => format.acodec !== "none");
+  if (!selected) return null;
+  const directUrl = selected.url as string;
 
-  const directUrl =
-    requested?.url ||
-    requestedFormat?.url ||
-    data?.url ||
-    null;
-
-  if (typeof directUrl !== "string" || !/^https?:\/\//i.test(directUrl)) {
-    return null;
+  let expiresAt = Date.now() + YTDLP_CONFIG.cacheTTL;
+  const params = new URL(directUrl).searchParams;
+  const signedExpiry = Number(params.get("expire") || params.get("expires"));
+  if (Number.isFinite(signedExpiry) && signedExpiry > 0) {
+    // Leave time to hand a signed URL to MPV before the origin rejects it.
+    expiresAt = Math.min(expiresAt, signedExpiry * 1000 - 30_000);
   }
 
   return {
     url: directUrl,
-    headers: toHeaderList(
-      requested?.http_headers ||
-        requestedFormat?.http_headers ||
-        data?.http_headers
-    ),
+    headers: toHeaderList({ ...data?.http_headers, ...selected.http_headers }),
     debugLabel,
-    ext: data?.ext || requested?.ext || requestedFormat?.ext,
-    formatId:
-      String(data?.format_id || requested?.format_id || requestedFormat?.format_id || "") ||
-      undefined,
-    protocol: data?.protocol || requested?.protocol || requestedFormat?.protocol,
+    ext: selected.ext || data?.ext,
+    formatId: String(selected.format_id || data?.format_id || "") || undefined,
+    protocol: selected.protocol || data?.protocol,
+    expiresAt,
   };
 }
 
@@ -806,11 +849,6 @@ function getPlaybackExtractionAttempts(
   if (!isYoutubeUrl(url)) {
     return [
       {
-        label: "generic-bestaudio-cookies",
-        format: "bestaudio/best",
-        useCookies: true,
-      },
-      {
         label: "generic-bestaudio-public",
         format: "bestaudio/best",
         useCookies: false,
@@ -824,19 +862,20 @@ function getPlaybackExtractionAttempts(
   const safeFormat =
     YTDLP_CONFIG.youtubeMpvSafeFormat || YOUTUBE_MPV_SAFE_FORMAT;
   const profile = normalizeAudioProfileName(audioProfile);
+  const defaultClient = YTDLP_CONFIG.youtubePlayerClients || null;
 
   const qualityAttempts: PlaybackExtractionAttempt[] = [
     {
       label: "youtube-balanced-quality-cookies",
       format: YOUTUBE_BALANCED_QUALITY_FORMAT,
       useCookies: true,
-      youtubePlayerClient: null,
+      youtubePlayerClient: defaultClient,
     },
     {
       label: "youtube-balanced-quality-public",
       format: YOUTUBE_BALANCED_QUALITY_FORMAT,
       useCookies: false,
-      youtubePlayerClient: null,
+      youtubePlayerClient: defaultClient,
     },
   ];
 
@@ -845,13 +884,13 @@ function getPlaybackExtractionAttempts(
       label: "youtube-bestaudio-cookies",
       format: "bestaudio/best",
       useCookies: true,
-      youtubePlayerClient: null,
+      youtubePlayerClient: defaultClient,
     },
     {
       label: "youtube-bestaudio-public",
       format: "bestaudio/best",
       useCookies: false,
-      youtubePlayerClient: null,
+      youtubePlayerClient: defaultClient,
     },
   ];
 
@@ -889,11 +928,9 @@ function getPlaybackExtractionAttempts(
 
   const seen = new Set<string>();
   return attempts.filter((attempt) => {
-    const key = [
-      attempt.format,
-      attempt.useCookies ? "cookies" : "public",
-      attempt.youtubePlayerClient || "default",
-    ].join("|");
+    // Cookies only apply when available for this platform. Compare effective
+    // arguments to avoid running the very same failed extraction twice.
+    const key = buildYtDlpArgs(url, ["-f", attempt.format], attempt).join("\0");
 
     if (seen.has(key)) return false;
     seen.add(key);
@@ -907,6 +944,21 @@ function getPlayableSourceCacheKey(
 ): string {
   if (!isYoutubeUrl(normalized)) return normalized;
   return `${normalizeAudioProfileName(audioProfile)}:${normalized}`;
+}
+
+/** Drop an expired/rejected signed URL before retrying playback. */
+export function invalidatePlayableSource(
+  url: string,
+  audioProfile?: AudioProfileName | null
+): void {
+  const normalized = normalizeUrl(url);
+  const keys = audioProfile == null && isYoutubeUrl(normalized)
+    ? ["balanced", "xbox"].map((profile) => `${profile}:${normalized}`)
+    : [getPlayableSourceCacheKey(normalized, audioProfile)];
+  for (const key of keys) {
+    DIRECT_CACHE.delete(key);
+    DIRECT_PENDING.delete(key);
+  }
 }
 
 export async function getPlayableSource(
@@ -929,56 +981,74 @@ export async function getPlayableSource(
   const cacheKey = getPlayableSourceCacheKey(normalized, audioProfile);
   const cached = cacheGet(DIRECT_CACHE, cacheKey);
   if (cached) return cached;
+  const pending = DIRECT_PENDING.get(cacheKey);
+  if (pending) return pending;
 
-  const tryOnce = async (
-    attempt: PlaybackExtractionAttempt
-  ): Promise<PlayableSource | null> => {
-    try {
-      const json = await runYtDlp(
-        normalized,
-        [
-          "--dump-single-json",
-          "-f",
-          attempt.format,
-          "--no-playlist",
+  const task: Promise<PlayableSource | null> = (async () => {
+    const deadline = Date.now() + YTDLP_CONFIG.processTimeoutMs;
+
+    const tryOnce = async (
+      attempt: PlaybackExtractionAttempt
+    ): Promise<PlayableSource | null> => {
+      try {
+        const json = await runYtDlp(
           normalized,
-        ],
-        {
-          useCookies: attempt.useCookies,
-          youtubePlayerClient: attempt.youtubePlayerClient,
-        }
-      );
-
-      const source = sourceFromYtDlpJson(JSON.parse(json), attempt.label);
-
-      if (source) {
-        cacheSet(DIRECT_CACHE, cacheKey, source);
-        console.log(
-          `[yt-dlp] playable source ${source.debugLabel || ""} ${
-            source.formatId || ""
-          } ${source.ext || ""}`.trim()
+          [
+            "--dump-single-json",
+            "-f",
+            attempt.format,
+            "--no-playlist",
+            normalized,
+          ],
+          {
+            useCookies: attempt.useCookies,
+            youtubePlayerClient: attempt.youtubePlayerClient,
+            timeoutMs: Math.max(1, Math.min(20_000, deadline - Date.now())),
+          }
         );
+
+        const source = sourceFromYtDlpJson(JSON.parse(json), attempt.label);
+
+        if (source) {
+          recordDiagnostic("YTDLP_SOURCE_RESOLVED");
+          if (DIRECT_PENDING.get(cacheKey) === task && (source.expiresAt ?? 0) > Date.now()) {
+            cacheSet(DIRECT_CACHE, cacheKey, source, source.expiresAt);
+          }
+          console.log(
+            `[yt-dlp] playable source ${source.debugLabel || ""} ${
+              source.formatId || ""
+            } ${source.ext || ""}`.trim()
+          );
+        }
+
+        return source;
+      } catch (err) {
+        console.warn(
+          `[getPlayableSource] extractor failed (${attempt.label})`,
+          err
+        );
+        return null;
       }
+    };
 
-      return source;
-    } catch (err) {
-      console.warn(
-        `[getPlayableSource] extractor failed (${attempt.label})`,
-        err
-      );
-      return null;
+    for (const attempt of getPlaybackExtractionAttempts(
+      normalized,
+      audioProfile
+    )) {
+      if (Date.now() >= deadline) break;
+      const source = await tryOnce(attempt);
+      if (source) return source;
     }
-  };
 
-  for (const attempt of getPlaybackExtractionAttempts(
-    normalized,
-    audioProfile
-  )) {
-    const source = await tryOnce(attempt);
-    if (source) return source;
+    return null;
+  })();
+
+  DIRECT_PENDING.set(cacheKey, task);
+  try {
+    return await task;
+  } finally {
+    if (DIRECT_PENDING.get(cacheKey) === task) DIRECT_PENDING.delete(cacheKey);
   }
-
-  return null;
 }
 
 /** Backward-compatible URL-only accessor for callers that do not load MPV. */

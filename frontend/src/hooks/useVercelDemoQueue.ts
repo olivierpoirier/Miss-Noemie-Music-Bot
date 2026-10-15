@@ -1,23 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Command, QueueResponse } from "../types";
-
-type BusyState =
-  | Command
-  | "play"
-  | "clear"
-  | "reorder_queue"
-  | "remove_queue_item"
-  | "requeue_history_item"
-  | null;
-
-type DemoResponse = {
-  ok: boolean;
-  state: QueueResponse;
-  toast?: string;
-};
+import useQueueFeedback, { type BusyState } from "./useQueueFeedback";
+import { requestDemo, DEMO_REQUEST_TIMEOUT } from "../lib/demo-api";
 
 const DEMO_API_BASE = import.meta.env.VITE_DEMO_API_BASE || "/api/demo";
-const BUSY_TIMEOUT = 12_000;
+const POLL_INTERVAL = 2500;
 
 const emptyState = (): QueueResponse => ({
   ok: true,
@@ -34,209 +21,128 @@ const emptyState = (): QueueResponse => ({
   stats: { totalQueued: 0, remainingTimeSec: 0 },
 });
 
-function makeClientRequestId(): string {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
-  }
-
-  return `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-}
-
-async function requestDemo(
-  action: string,
-  payload?: Record<string, unknown>
-): Promise<DemoResponse> {
-  const response = await fetch(
-    `${DEMO_API_BASE}?action=${encodeURIComponent(action)}`,
-    {
-      method: payload ? "POST" : "GET",
-      headers: payload ? { "Content-Type": "application/json" } : undefined,
-      body: payload ? JSON.stringify(payload) : undefined,
-    }
-  );
-
-  if (!response.ok) {
-    throw new Error(`Demo backend responded with ${response.status}`);
-  }
-
-  return response.json() as Promise<DemoResponse>;
-}
-
 export default function useVercelDemoQueue() {
-  const [serverState, setServerState] = useState<QueueResponse>(() =>
-    emptyState()
-  );
-  const [toast, setToast] = useState("");
-  const [systemError, setSystemError] = useState<string | null>(null);
-  const [busy, setBusyState] = useState<BusyState>(null);
-  const busyTimerRef = useRef<number | null>(null);
+  const [serverState, setServerState] = useState<QueueResponse>(emptyState);
+  const feedback = useQueueFeedback(DEMO_REQUEST_TIMEOUT + 1000);
+  const { setToast, setSystemError, setBusy, clearBusy } = feedback;
+  const mountedRef = useRef(false);
+  const controllersRef = useRef(new Set<AbortController>());
+  const versionRef = useRef(0);
+  const pendingActionsRef = useRef(0);
+  const actionQueueRef = useRef<Promise<void>>(Promise.resolve());
   const playInFlightRef = useRef(false);
 
-  const clearBusy = useCallback(() => {
-    setBusyState(null);
-
-    if (busyTimerRef.current) {
-      window.clearTimeout(busyTimerRef.current);
-      busyTimerRef.current = null;
+  const request = useCallback(async (
+    action: string,
+    payload?: Record<string, unknown>
+  ) => {
+    const controller = new AbortController();
+    controllersRef.current.add(controller);
+    try {
+      return await requestDemo(action, payload, { baseUrl: DEMO_API_BASE, signal: controller.signal });
+    } finally {
+      controllersRef.current.delete(controller);
     }
   }, []);
-
-  const setBusy = useCallback((value: BusyState) => {
-    setBusyState(value);
-
-    if (busyTimerRef.current) {
-      window.clearTimeout(busyTimerRef.current);
-      busyTimerRef.current = null;
-    }
-
-    if (value) {
-      busyTimerRef.current = window.setTimeout(() => {
-        setBusyState(null);
-        busyTimerRef.current = null;
-      }, BUSY_TIMEOUT);
-    }
-  }, []);
-
-  const applyResponse = useCallback(
-    (payload: DemoResponse) => {
-      setServerState(payload.state ?? emptyState());
-
-      if (payload.toast) {
-        setToast(payload.toast);
-        window.setTimeout(() => setToast(""), 4500);
-      }
-
-      clearBusy();
-      setSystemError(null);
-    },
-    [clearBusy]
-  );
 
   const refreshState = useCallback(async () => {
+    if (pendingActionsRef.current > 0) return;
+    const version = versionRef.current;
     try {
-      const payload = await requestDemo("state");
-      setServerState(payload.state ?? emptyState());
+      const payload = await request("state");
+      // A poll started before a command must not restore its stale snapshot.
+      if (!mountedRef.current || version !== versionRef.current) return;
+      setServerState(payload.state);
       setSystemError(null);
     } catch (err) {
+      if (!mountedRef.current || version !== versionRef.current) return;
       console.warn("Demo backend inaccessible", err);
-      setSystemError("Serveur hors ligne.");
+      setSystemError("Serveur hors ligne. Reconnexion automatique…");
     }
-  }, []);
+  }, [request, setSystemError]);
 
   useEffect(() => {
-    void refreshState();
-
-    const id = window.setInterval(() => {
-      void refreshState();
-    }, 2500);
-
+    mountedRef.current = true;
+    let timer: number;
+    let cancelled = false;
+    const poll = async () => {
+      await refreshState();
+      if (!cancelled) timer = window.setTimeout(() => void poll(), POLL_INTERVAL);
+    };
+    void poll();
+    const controllers = controllersRef.current;
     return () => {
-      window.clearInterval(id);
+      cancelled = true;
+      mountedRef.current = false;
+      versionRef.current += 1;
+      window.clearTimeout(timer);
+      for (const controller of controllers) controller.abort();
     };
   }, [refreshState]);
 
-  useEffect(() => {
-    return () => {
-      if (busyTimerRef.current) {
-        window.clearTimeout(busyTimerRef.current);
-      }
-    };
-  }, []);
-
-  const runAction = useCallback(
-    async (
-      action: string,
-      payload: Record<string, unknown> | undefined,
-      busyKey: BusyState
-    ) => {
+  const runAction = useCallback((
+    action: string,
+    payload: Record<string, unknown> | undefined,
+    busyKey: BusyState
+  ) => {
+    versionRef.current += 1;
+    pendingActionsRef.current += 1;
+    // Preserve click order and avoid racing command responses with each other
+    // or with the background poll.
+    const task = actionQueueRef.current.then(async () => {
+      if (!mountedRef.current) return;
+      setBusy(busyKey);
       try {
-        if (busyKey) {
-          setBusy(busyKey);
-        }
-
-        const response = await requestDemo(action, payload);
-        applyResponse(response);
+        const response = await request(action, payload);
+        if (!mountedRef.current) return;
+        setServerState(response.state);
+        if (response.toast) setToast(response.toast);
+        setSystemError(null);
       } catch (err) {
+        if (!mountedRef.current) return;
         console.warn(`Demo action failed: ${action}`, err);
-        clearBusy();
-        setToast("Erreur : Serveur hors ligne");
-        window.setTimeout(() => setToast(""), 4500);
+        setToast(err instanceof Error ? err.message : "Serveur hors ligne.");
+      } finally {
+        if (mountedRef.current) clearBusy();
       }
-    },
-    [applyResponse, clearBusy, setBusy]
-  );
+    }).finally(() => {
+      pendingActionsRef.current -= 1;
+    });
+    actionQueueRef.current = task;
+    return task;
+  }, [clearBusy, request, setBusy, setSystemError, setToast]);
 
-  const play = useCallback(
-    (url: string, addedBy?: string) => {
-      if (playInFlightRef.current) {
-        return;
-      }
+  const play = useCallback((url: string, addedBy?: string) => {
+    if (playInFlightRef.current) return false;
+    playInFlightRef.current = true;
+    const clientRequestId = typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    void runAction("play", { url, addedBy, clientRequestId }, "play").finally(() => {
+      playInFlightRef.current = false;
+    });
+    return true;
+  }, [runAction]);
 
-      playInFlightRef.current = true;
-      void runAction(
-        "play",
-        {
-          url,
-          addedBy,
-          clientRequestId: makeClientRequestId(),
-        },
-        "play"
-      ).finally(() => {
-        playInFlightRef.current = false;
-      });
-    },
-    [runAction]
-  );
-
-  const command = useCallback(
-    (cmd: Command, arg?: number | string) => {
-      void runAction("command", { cmd, arg }, cmd);
-    },
-    [runAction]
-  );
+  const command = useCallback((cmd: Command, arg?: number | string) => {
+    void runAction("command", { cmd, arg }, cmd);
+  }, [runAction]);
 
   const clear = useCallback(() => {
     void runAction("clear", undefined, "clear");
   }, [runAction]);
 
-  const reorderQueue = useCallback(
-    (ids: string[]) => {
-      void runAction("reorder_queue", { ids }, "reorder_queue");
-    },
-    [runAction]
-  );
+  const reorderQueue = useCallback((ids: string[]) => {
+    void runAction("reorder_queue", { ids }, "reorder_queue");
+  }, [runAction]);
 
-  const removeQueueItem = useCallback(
-    (id: string) => {
-      void runAction("remove_queue_item", { id }, "remove_queue_item");
-    },
-    [runAction]
-  );
+  const removeQueueItem = useCallback((id: string) => {
+    void runAction("remove_queue_item", { id }, "remove_queue_item");
+  }, [runAction]);
 
-  const requeueHistoryItem = useCallback(
-    (id: string, targetIndex?: number) => {
-      void runAction(
-        "requeue_history_item",
-        { id, targetIndex },
-        "requeue_history_item"
-      );
-    },
-    [runAction]
-  );
+  const requeueHistoryItem = useCallback((id: string, targetIndex?: number) => {
+    void runAction("requeue_history_item", { id, targetIndex }, "requeue_history_item");
+  }, [runAction]);
 
-  return {
-    state: serverState,
-    toast,
-    setToast,
-    systemError,
-    setSystemError,
-    play,
-    command,
-    busy,
-    setBusy,
-    clear,
-    reorderQueue,
-    removeQueueItem,
-    requeueHistoryItem,
-  };
+  return { state: serverState, ...feedback, play, command, clear, reorderQueue, removeQueueItem, requeueHistoryItem };
 }

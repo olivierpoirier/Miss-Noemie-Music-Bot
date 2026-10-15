@@ -12,6 +12,7 @@ import ThemeDock from "./components/ThemeDock";
 import ThemeScene from "./components/ThemeScene";
 import SystemAlert from "./components/SystemAlert";
 import DemoAudioNotice from "./components/DemoAudioNotice";
+import DiagnosticsPanel from "./components/DiagnosticsPanel";
 
 import SectionCard, { SectionTab } from "./components/SectionCard";
 import HistoryList from "./components/HistoryList";
@@ -26,20 +27,7 @@ import {
   THEME_ORDER,
   isThemeName,
 } from "./lib/themes";
-import type { Now, QueueItem, Control } from "./types";
-
-type Command =
-  | "pause"
-  | "resume"
-  | "skip"
-  | "skip_group"
-  | "shuffle_queue"
-  | "previous"
-  | "repeat"
-  | "random_mode"
-  | "audio_profile"
-  | "seek"
-  | "seek_abs";
+import type { Now, QueueItem, Control, Command } from "./types";
 
 type CollapsedSections = {
   nowPlaying: boolean;
@@ -50,7 +38,14 @@ type CollapsedSections = {
 
 export default function App() {
   const [url, setUrl] = useState("");
-  const [name, setName] = useState("");
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [name, setName] = useState(() => {
+    try {
+      return localStorage.getItem("xmb_name") || "";
+    } catch {
+      return "";
+    }
+  });
 
   const [mode, setMode] = useState<ThemeMode>(() => {
     try {
@@ -88,6 +83,7 @@ export default function App() {
     toast,
     setToast,
     systemError,
+    setSystemError,
     play,
     command,
     busy,
@@ -113,16 +109,6 @@ export default function App() {
       console.warn(err);
     }
   }, [theme]);
-
-  useEffect(() => {
-    try {
-      const n = localStorage.getItem("xmb_name");
-      if (n) setName(n);
-    } catch (err) {
-      console.warn(err);
-      setToast("Impossible de charger ton nom sauvegardé.");
-    }
-  }, [setToast]);
 
   useEffect(() => {
     try {
@@ -166,13 +152,9 @@ export default function App() {
       const looksLikeUrl = /^https?:\/\//i.test(urlCandidate);
       const finalInput = looksLikeUrl ? urlCandidate : raw;
 
-      if (looksLikeUrl && !/^https?:\/\//i.test(finalInput)) {
-        setToast("URL invalide ❌");
-        return;
+      if (play(finalInput, name.trim() || "anon")) {
+        setUrl("");
       }
-
-      play(finalInput, name.trim() || "anon");
-      setUrl("");
     } catch (err) {
       console.error("Erreur addToQueue", err);
       setToast("Impossible d’ajouter le lien.");
@@ -183,7 +165,6 @@ export default function App() {
     (cmd: Command, arg?: number | string) => {
       try {
         command(cmd, arg);
-        window.setTimeout(() => setBusy(null), 4000);
       } catch (err) {
         console.error(`Commande échouée (${cmd})`, err);
         setBusy(null);
@@ -218,7 +199,7 @@ export default function App() {
         window.clearTimeout(transitionTimeoutRef.current);
       }
 
-      window.setTimeout(() => {
+      transitionTimeoutRef.current = window.setTimeout(() => {
         if (nextMode === "rainbow") {
           setMode("rainbow");
         } else if (nextTheme) {
@@ -238,6 +219,8 @@ export default function App() {
     switchThemeSmooth("rainbow");
   }, [switchThemeSmooth]);
 
+  const clearToast = useCallback(() => setToast(""), [setToast]);
+
   const pickNextColor = useCallback(() => {
     try {
       const currentIndex = THEME_ORDER.indexOf(theme);
@@ -254,6 +237,8 @@ export default function App() {
     paused: false,
     skipSeq: 0,
     repeat: false,
+    randomMode: false,
+    audioProfile: "balanced",
   };
 
   const randomMode = Boolean(control.randomMode);
@@ -287,6 +272,15 @@ export default function App() {
           isOpen={Boolean(systemError)}
           message={systemError}
           rainbow={rainbow}
+          onShowDiagnostics={() => {
+            setSystemError(null);
+            setDiagnosticsOpen(true);
+            window.requestAnimationFrame(() => {
+              const panel = document.getElementById("bot-diagnostics");
+              panel?.scrollIntoView({ behavior: "smooth", block: "start" });
+              panel?.querySelector("summary")?.focus({ preventScroll: true });
+            });
+          }}
         />
 
         <AppHeader
@@ -299,7 +293,7 @@ export default function App() {
         {toast && (
           <Toast
             message={toast}
-            clear={() => setToast("")}
+            clear={clearToast}
             rainbow={rainbow}
           />
         )}
@@ -442,6 +436,8 @@ export default function App() {
               </SectionCard>
             </div>
           </div>
+
+          <DiagnosticsPanel theme={theme} rainbow={rainbow} open={diagnosticsOpen} onOpenChange={setDiagnosticsOpen} />
 
           </div>
 

@@ -3,18 +3,10 @@ import { io, Socket } from "socket.io-client";
 import type { QueueResponse, Command, QueueItem } from "../types";
 import useVercelDemoQueue from "./useVercelDemoQueue";
 import { IS_VERCEL_DEMO, SOCKET_SERVER_URL } from "../lib/runtime";
-
-type BusyState =
-  | Command
-  | "play"
-  | "clear"
-  | "reorder_queue"
-  | "remove_queue_item"
-  | "requeue_history_item"
-  | null;
+import useQueueFeedback, { type BusyState } from "./useQueueFeedback";
 
 const BUSY_TIMEOUT = 30_000;
-const PENDING_MAX_AGE_MS = 60_000;
+const PENDING_MAX_AGE_MS = 5 * 60_000;
 
 function makeClientRequestId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -34,22 +26,27 @@ function useSocketQueue() {
     now: null,
     queue: [],
     history: [],
-    control: { paused: false, skipSeq: 0, repeat: false, randomMode: false },
+    control: { paused: false, skipSeq: 0, repeat: false, randomMode: false, audioProfile: "balanced" },
     stats: { totalQueued: 0, remainingTimeSec: 0 },
   });
 
   const [pendingItems, setPendingItems] = useState<PendingItem[]>([]);
-  const [toast, setToast] = useState("");
-  const [systemError, setSystemError] = useState<string | null>(null);
-  const [busy, setBusyState] = useState<BusyState>(null);
+  const feedback = useQueueFeedback(BUSY_TIMEOUT);
+  const { setToast, setSystemError, busyRef, clearBusy, setBusy } = feedback;
 
   const socketRef = useRef<Socket | null>(null);
-  const busyTimerRef = useRef<number | null>(null);
+  const activeRequestRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (pendingItems.length === 0) return;
 
     const id = window.setInterval(() => {
+      const active = pendingItems.find((item) => item.clientRequestId === activeRequestRef.current);
+      if (active && Date.now() - active.createdAt >= PENDING_MAX_AGE_MS) {
+        activeRequestRef.current = null;
+        if (busyRef.current === "play") clearBusy();
+        setToast("L'ajout n'a pas été confirmé. Vérifie la file avant de réessayer.");
+      }
       setPendingItems((prev) => {
         const next = prev.filter(
           (item) => Date.now() - item.createdAt < PENDING_MAX_AGE_MS
@@ -60,32 +57,12 @@ function useSocketQueue() {
     }, 2000);
 
     return () => clearInterval(id);
-  }, [pendingItems.length]);
-
-  const clearBusy = useCallback(() => {
-    setBusyState(null);
-
-    if (busyTimerRef.current) {
-      clearTimeout(busyTimerRef.current);
-      busyTimerRef.current = null;
-    }
-  }, []);
-
-  const setBusy = useCallback((value: BusyState) => {
-    setBusyState(value);
-
-    if (busyTimerRef.current) {
-      clearTimeout(busyTimerRef.current);
-    }
-
-    busyTimerRef.current = window.setTimeout(() => {
-      setBusyState(null);
-    }, BUSY_TIMEOUT);
-  }, []);
+  }, [pendingItems, busyRef, clearBusy, setToast]);
 
   useEffect(() => {
     const s = io(SOCKET_SERVER_URL || undefined, {
-      transports: ["websocket"],
+      transports: ["websocket", "polling"],
+      tryAllTransports: true,
     });
 
     socketRef.current = s;
@@ -93,23 +70,14 @@ function useSocketQueue() {
     s.on("state", (payload: QueueResponse) => {
       const queue = payload.queue ?? [];
       const now = payload.now ?? null;
+      const resolvedIds = new Set(
+        [...queue, ...(payload.history ?? []), ...(now ? [now] : [])]
+          .map((item) => item.clientRequestId)
+          .filter(Boolean)
+      );
 
       setPendingItems((prev) =>
-        prev.filter((pending) => {
-          const foundInQueue = queue.some(
-            (q) =>
-              q.clientRequestId &&
-              pending.clientRequestId &&
-              q.clientRequestId === pending.clientRequestId
-          );
-
-          const foundInNow =
-            Boolean(now?.clientRequestId) &&
-            Boolean(pending.clientRequestId) &&
-            now?.clientRequestId === pending.clientRequestId;
-
-          return !foundInQueue && !foundInNow;
-        })
+        prev.filter((pending) => !resolvedIds.has(pending.clientRequestId))
       );
 
       setServerState({
@@ -122,42 +90,66 @@ function useSocketQueue() {
           skipSeq: 0,
           repeat: false,
           randomMode: false,
+          audioProfile: "balanced",
         },
         stats: payload.stats ?? { totalQueued: 0, remainingTimeSec: 0 },
       });
 
-      clearBusy();
+      // Background progress updates must not unlock an unresolved Spotify or
+      // playlist request and allow the same form to be submitted again.
+      if (busyRef.current !== "play" || resolvedIds.has(activeRequestRef.current ?? "")) {
+        if (resolvedIds.has(activeRequestRef.current ?? "")) activeRequestRef.current = null;
+        clearBusy();
+      }
     });
 
-    s.on("error_system", (message?: string) => {
-      setSystemError(message || "Virtual audio routing is not available on the server.");
+    s.on("play_result", (result: { clientRequestId?: string; ok: boolean; message?: string }) => {
+      if (result.clientRequestId) {
+        setPendingItems((prev) => prev.filter((item) => item.clientRequestId !== result.clientRequestId));
+        if (result.clientRequestId === activeRequestRef.current) {
+          activeRequestRef.current = null;
+          if (busyRef.current === "play") clearBusy();
+        }
+      }
+      if (!result.ok && result.message) setToast(result.message);
+    });
+
+    s.on("error_system", (message?: string | null) => {
+      setSystemError(message ?? null);
     });
 
     s.on("toast", (msg: string) => {
       setToast(msg);
-      setTimeout(() => setToast(""), 4500);
     });
 
     s.on("connect", () => {
       setToast("🔗 Connecté au serveur");
-      setTimeout(() => setToast(""), 4500);
+      setSystemError(null);
+    });
+
+    s.on("connect_error", () => {
+      setToast("⚡ Serveur inaccessible. Reconnexion automatique…");
+      clearBusy();
     });
 
     s.on("disconnect", () => {
       setToast("⚡ Connexion perdue");
+      activeRequestRef.current = null;
       clearBusy();
     });
 
     return () => {
+      socketRef.current = null;
+      s.removeAllListeners();
       s.close();
     };
-  }, [clearBusy]);
+  }, [busyRef, clearBusy, setSystemError, setToast]);
 
   const emitSafe = useCallback(
     (event: string, payload?: unknown, busyKey?: BusyState) => {
       if (!socketRef.current?.connected) {
         setToast("❌ Erreur : Serveur hors ligne");
-        return;
+        return false;
       }
 
       if (busyKey) {
@@ -165,18 +157,24 @@ function useSocketQueue() {
       }
 
       socketRef.current.emit(event, payload);
+      return true;
     },
-    [setBusy]
+    [setBusy, setToast]
   );
 
   const play = useCallback(
     (url: string, addedBy?: string) => {
       if (!socketRef.current?.connected) {
         setToast("❌ Erreur : Serveur hors ligne");
-        return;
+        return false;
+      }
+      if (activeRequestRef.current) {
+        setToast("Un ajout est déjà en cours. Patiente encore un instant.");
+        return false;
       }
 
       const clientRequestId = makeClientRequestId();
+      activeRequestRef.current = clientRequestId;
 
       const pendingItem: PendingItem = {
         id: `pending_${clientRequestId}`,
@@ -191,15 +189,16 @@ function useSocketQueue() {
       };
 
       setPendingItems((prev) => [pendingItem, ...prev].slice(0, 8));
-      setBusy("play");
+      setBusy("play", PENDING_MAX_AGE_MS);
 
       socketRef.current.emit("play", {
         url,
         addedBy,
         clientRequestId,
       });
+      return true;
     },
-    [setBusy]
+    [setBusy, setToast]
   );
 
   const command = (cmd: Command, arg?: number | string) =>
@@ -229,20 +228,16 @@ function useSocketQueue() {
         skipSeq: 0,
         repeat: false,
         randomMode: false,
+        audioProfile: "balanced",
       },
     };
   }, [pendingItems, serverState]);
 
   return {
     state: mergedState,
-    toast,
-    setToast,
-    systemError,
-    setSystemError,
+    ...feedback,
     play,
     command,
-    busy,
-    setBusy,
     clear,
     reorderQueue,
     removeQueueItem,

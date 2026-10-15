@@ -6,6 +6,7 @@ import GlitchText from "./GlitchText";
 import VideoPreview from "./VideoPreview";
 import type { ThemeName } from "../lib/themes";
 import { getThemeUi } from "../lib/theme-ui";
+import { playbackPosition, formatPlaybackTime as formatTime } from "../../../shared/playback.js";
 
 interface Props {
   now: Now | null;
@@ -16,16 +17,6 @@ interface Props {
   theme: ThemeName;
   spectrumHeightPx?: number;
   spectrumBars?: number;
-}
-
-function formatTime(sec: number): string {
-  const s = Math.max(0, Math.floor(sec));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const ss = s % 60;
-  return h > 0
-    ? `${h}:${String(m).padStart(2, "0")}:${String(ss).padStart(2, "0")}`
-    : `${m}:${String(ss).padStart(2, "0")}`;
 }
 
 export default function NowPlaying({
@@ -41,7 +32,7 @@ export default function NowPlaying({
   const [, setTick] = useState(0);
 
   useEffect(() => {
-    if (paused || !now?.startedAt || now?.isBuffering) return;
+    if (paused || now?.startedAt == null || now.isBuffering) return;
     const interval = setInterval(() => setTick((t) => t + 1), 1000);
     return () => clearInterval(interval);
   }, [paused, now?.startedAt, now?.isBuffering]);
@@ -55,19 +46,9 @@ export default function NowPlaying({
     now.title !== "Initialisation du flux..." &&
     now.title !== "Envoi au serveur...";
 
-  const calculatePos = () => {
-    if (!now) return 0;
-    if (isBuffering || paused || !now.startedAt) {
-      return now.positionOffsetSec || 0;
-    }
-    const elapsedSinceStart = (Date.now() - now.startedAt) / 1000;
-    return elapsedSinceStart;
-  };
-
-  const hasDur = !!now?.durationSec && now.durationSec > 0;
+  const hasDur = Number.isFinite(now?.durationSec) && (now?.durationSec ?? 0) > 0;
   const dur = hasDur ? now!.durationSec! : 0;
-  const currentPos = calculatePos();
-  const pos = hasDur ? Math.min(dur, Math.max(0, currentPos)) : Math.max(0, currentPos);
+  const pos = playbackPosition(now, paused);
 
   const ui = getThemeUi({ theme, rainbow });
 
