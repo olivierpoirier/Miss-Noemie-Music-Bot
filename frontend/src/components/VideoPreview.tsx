@@ -46,7 +46,7 @@ export default function VideoPreview({ url, rainbow = false }: Props) {
 
   return (
     <section
-      className={`mt-5 overflow-hidden rounded-xl border border-white/10 bg-black/20 ${
+      className={`mt-5 overflow-hidden rounded-[var(--ui-card-radius)] border border-white/10 bg-black/20 ${
         rainbow ? "rainbow-cycle" : ""
       }`}
     >
@@ -64,7 +64,7 @@ export default function VideoPreview({ url, rainbow = false }: Props) {
         <button
           type="button"
           onClick={toggle}
-          className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs font-semibold text-white/80 transition hover:bg-white/10 hover:text-white"
+          className="themed-ghost-button inline-flex items-center gap-2 px-3 py-2 text-xs font-semibold text-white/80"
           aria-pressed={enabled}
         >
           {enabled ? <EyeOff size={15} /> : <Eye size={15} />}

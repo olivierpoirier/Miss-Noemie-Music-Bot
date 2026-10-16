@@ -1,0 +1,21 @@
+Pour ce projet, c'est important de faire ceci :
+
+- Garder le style de l'app dans un sens artistique et beau
+
+- Toujours revérifier si l'app à ses dépendances à jour et si a besoin de modification, de les modifier
+
+- Si l'app est observée par un AI, regarder quelle intelligence ou moteur AI on doit utiliser et faire un rapport avec
+
+- Vérifier si la qualitée audio est la meilleure disponible sur le marché et tester l'audio pour un son clair et cristallin sur les plateformes. La priorité est Discord
+
+- Vérifier que le backend n'est pas trop lourd pour des ordinateurs moins puissants comme i5
+
+- Vérifier que les toutes les fonctionnalités du backend fonctionnent bien
+
+- Toujours avoir des noms de boutons, composants et hooks qui sont parlant et descriptifs et parlant. Si ce n'est pas le cas, les nommer dans un rapport pour les changer
+
+- Toujours vérifier pour du code inutilisé et si oui, les écrire dans votre rapport
+
+- Toujours optimiser le code sans perdre de fonctionnalités
+
+- Vérifier pour des potentielles erreurs 403 ou autre venant de YouTube ou Spotify ou Autre

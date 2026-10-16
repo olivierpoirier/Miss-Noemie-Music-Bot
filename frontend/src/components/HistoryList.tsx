@@ -44,7 +44,7 @@ export default function HistoryList({
                 soft
                 className={cn(
                   "group p-2 flex items-center gap-3 cursor-grab active:cursor-grabbing",
-                  isAdventurer && "rounded-[20px]"
+                  isAdventurer && "rounded-[var(--ui-card-radius)]"
                 )}
               >
                 <div
@@ -69,8 +69,8 @@ export default function HistoryList({
                       className={cn(
                         "w-10 h-10 object-cover shrink-0",
                         isAdventurer
-                          ? "rounded-xl border border-[#d5c5a1]/20"
-                          : "rounded-lg border border-slate-700",
+                          ? "rounded-[18px] border border-[#d5c5a1]/20"
+                          : "rounded-[18px] border border-slate-700",
                         rainbow && "rainbow-cycle"
                       )}
                       onError={(e) => {
@@ -82,8 +82,8 @@ export default function HistoryList({
                       className={cn(
                         "w-10 h-10 shrink-0 flex items-center justify-center",
                         isAdventurer
-                          ? "rounded-xl border border-[#d5c5a1]/20 bg-black/20"
-                          : "rounded-lg border border-slate-700 bg-black/20",
+                          ? "rounded-[18px] border border-[#d5c5a1]/20 bg-black/20"
+                          : "rounded-[18px] border border-slate-700 bg-black/20",
                         rainbow && "rainbow-cycle"
                       )}
                     >
@@ -118,7 +118,7 @@ export default function HistoryList({
                   <button
                     onClick={() => onReAdd(item.id)}
                     className={cn(
-                      "p-2 rounded-lg shrink-0 themed-secondary-button",
+                      "p-2 rounded-full shrink-0 themed-secondary-button",
                       rainbow && "rainbow-cycle"
                     )}
                     title="Réajouter à la file"

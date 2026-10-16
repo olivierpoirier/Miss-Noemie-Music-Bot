@@ -29,6 +29,13 @@ function envNumber(key: string, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
+function envList(key: string): string[] {
+  return readEnv(key)
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
 export const APP_CONFIG = {
   PORT: Math.min(65535, Math.floor(envNumber("PORT", 4000))),
   // Keep playback alive when browsers sleep or the tunnel reconnects.
@@ -52,13 +59,13 @@ export const DIAGNOSTICS_CONFIG = {
   maxEvents: 100,
 };
 
+const BACKEND_ROOT = fileURLToPath(new URL("../", import.meta.url));
+
 function findCookiesPath(): string | null {
   const explicitPath = readEnv("YTDLP_COOKIES_PATH");
   const candidates = [
     explicitPath,
-    path.resolve(process.cwd(), "cookies.txt"),
-    path.resolve(process.cwd(), "www.youtube.com_cookies.txt"),
-    path.resolve(process.cwd(), "backend", "cookies.txt"),
+    path.resolve(BACKEND_ROOT, "cookies.txt"),
   ].filter(Boolean);
 
   return (
@@ -78,6 +85,7 @@ const HAS_COOKIES = Boolean(COOKIES_PATH);
 function findBundledYtDlpBinary(): string | null {
   const binaryName = IS_WINDOWS ? "yt-dlp.exe" : "yt-dlp";
   const candidates = [
+    path.resolve(BACKEND_ROOT, "node_modules", "yt-dlp-exec", "bin", binaryName),
     path.resolve(
       process.cwd(),
       "node_modules",
@@ -180,6 +188,33 @@ export const MPV_CONFIG = {
 export const PLAYER_CONFIG = {
   preloadAhead: Math.min(envNumber("PLAYER_PRELOAD_AHEAD", 3), 6),
   preloadCacheMax: Math.min(envNumber("PLAYER_PRELOAD_CACHE_MAX", 8), 16),
+  providerMatchCacheMax: Math.min(
+    envNumber("PLAYER_PROVIDER_MATCH_CACHE_MAX", 1_000),
+    10_000
+  ),
+  providerMatchCacheTTLMs: Math.min(
+    envNumber("PLAYER_PROVIDER_MATCH_CACHE_TTL_MS", 86_400_000),
+    604_800_000
+  ),
+  providerMatchCachePath: envOrDefault(
+    "PLAYER_PROVIDER_MATCH_CACHE_PATH",
+    path.resolve(BACKEND_ROOT, ".data", "provider-match-cache.json")
+  ),
+};
+
+export const SECURITY_CONFIG = {
+  allowedOrigins: envList("BACKEND_ALLOWED_ORIGINS"),
+  maxSocketPayloadBytes: Math.min(
+    envNumber("SOCKET_MAX_PAYLOAD_BYTES", 64_000),
+    1_000_000
+  ),
+  socketRateLimitWindowMs: Math.min(
+    envNumber("SOCKET_RATE_LIMIT_WINDOW_MS", 10_000),
+    60_000
+  ),
+  socketRateLimitMax: Math.min(envNumber("SOCKET_RATE_LIMIT_MAX", 40), 240),
+  queueInputMaxLength: Math.min(envNumber("QUEUE_INPUT_MAX_LENGTH", 1_000), 4_000),
+  reorderMaxItems: Math.min(envNumber("QUEUE_REORDER_MAX_ITEMS", 300), 1_000),
 };
 
 export const YTDLP_CONFIG = {
@@ -200,7 +235,19 @@ export const YTDLP_CONFIG = {
 
   cacheTTL: 600_000,
   cacheMax: 512,
+  searchCacheTTLMs: Math.min(
+    envNumber("YTDLP_SEARCH_CACHE_TTL_MS", 21_600_000),
+    86_400_000
+  ),
   processTimeoutMs: 60_000,
+  soundCloudMetadataTimeoutMs: Math.min(
+    envNumber("YTDLP_SOUNDCLOUD_METADATA_TIMEOUT_MS", 8_000),
+    30_000
+  ),
+  soundCloudPlaybackTimeoutMs: Math.min(
+    envNumber("YTDLP_SOUNDCLOUD_PLAYBACK_TIMEOUT_MS", 5_000),
+    20_000
+  ),
   cookiesPath: COOKIES_PATH,
   hasCookies: HAS_COOKIES,
   cookiesFromBrowser: readEnv("YTDLP_COOKIES_FROM_BROWSER"),

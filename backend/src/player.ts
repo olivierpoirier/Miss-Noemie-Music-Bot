@@ -20,9 +20,10 @@ import {
   mpvSetAudioProfile,
 } from "./mpv.js";
 import {
+  buildSoundCloudYoutubeQuery,
   getPlayableSource,
   normalizeUrl,
-  resolvePlayable,
+  probeSingle,
   searchYoutubeVideo,
   invalidatePlayableSource,
   type PlayableSource,
@@ -30,6 +31,15 @@ import {
 import { MPV_CONFIG, PLAYER_CONFIG } from "./config.js";
 import { ensureAudioRoutingReady, isVirtualAudioRoutingReady } from "./utils.js";
 import type { AudioProfileName } from "./audioProfiles.js";
+import { isSoundCloudUrl } from "./platforms/index.js";
+import { performance } from "node:perf_hooks";
+import { recordBackendMetric } from "./metrics.js";
+import {
+  deleteProviderMatch,
+  getProviderMatch,
+  setProviderMatch,
+  type ProviderMatch,
+} from "./providerCache.js";
 
 let globalMpvHandle: MpvHandle | null = null;
 let mpvStartTask: Promise<MpvHandle> | null = null;
@@ -45,6 +55,7 @@ let currentListener: ((ev: MpvEvent) => void) | null = null;
 let listenerHandle: MpvHandle | null = null;
 let progressTimer: ReturnType<typeof setInterval> | null = null;
 const playbackRetries = new Map<string, number>();
+const attemptedSources = new Map<string, { source: PlayableSource; pageUrl: string }>();
 const MAX_PLAYBACK_RETRIES = 1;
 const PLAYBACK_STALL_TIMEOUT_MS = 60_000;
 
@@ -112,6 +123,35 @@ let preloaded = new Map<string, PreloadedSource>();
 let preloading = new Map<string, PreloadingSource>();
 let preloadWorkerRunning = false;
 
+function normalizeProviderMatchText(value: string): string {
+  return value.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " ");
+}
+
+function spotifyMatchCacheKey(query: string, durationSec?: number | null): string {
+  return ["spotify", normalizeProviderMatchText(query), Math.round(durationSec || 0)].join("|");
+}
+
+function soundCloudFallbackCacheKey(url: string): string {
+  return `soundcloud-fallback|${url}`;
+}
+
+function applyProviderMatch(item: QueueItem, match: ProviderMatch): void {
+  item.sourceUrl ??= item.url;
+  item.url = match.url;
+  item.title ||= match.title;
+  item.thumb ||= match.thumb || null;
+  item.durationSec ||= match.durationSec || 0;
+}
+
+function recordProviderMatchCache(provider: "spotify" | "soundcloud", hit: boolean, startedAt: number): void {
+  recordBackendMetric("provider-match-cache", performance.now() - startedAt, true, { provider, hit });
+}
+
+function canResolveItem(item: QueueItem, generation: number): boolean {
+  return engineGeneration === generation && (item.status === "queued" || item.status === "playing");
+}
+
 function trimPreloadCache(): void {
   const usableIds = new Set(
     state.queue
@@ -172,12 +212,13 @@ async function resolveItemToSource(
   item: QueueItem,
   audioProfile: AudioProfileName
 ): Promise<PlayableSource | null> {
+  const generation = engineGeneration;
   const spotifyOk = await resolveSpotifyItem(item);
-  if (!spotifyOk) return null;
+  if (!spotifyOk || !canResolveItem(item, generation)) return null;
 
   if (item.url.startsWith("provider:")) return null;
 
-  return getPlayableSource(normalizeUrl(item.url), audioProfile);
+  return resolveFreshItemSource(item, audioProfile);
 }
 
 async function preloadTrack(item: QueueItem): Promise<PlayableSource | null> {
@@ -437,6 +478,7 @@ async function tryPlayWith(
     const handle = await ensureMpvRunning();
     if (!isCurrentAttempt(item, generation)) return false;
 
+    attemptedSources.set(item.id, { source, pageUrl: item.url });
     setPlaying({ item, handle });
 
     state.now = {
@@ -477,23 +519,33 @@ async function tryPlayWith(
 
 /* ------------------- RESOLUTION ------------------- */
 
-async function resolveSpotifyItem(item: QueueItem): Promise<boolean> {
-  if (!item.url.startsWith("provider:spotify:")) return true;
+async function resolveSpotifyItem(item: QueueItem, bypassCache = false): Promise<boolean> {
+  const originalUrl = item.sourceUrl || item.url;
+  if (!originalUrl.startsWith("provider:spotify:")) return true;
+  const generation = engineGeneration;
 
   try {
-    const query = item.url.replace("provider:spotify:", "").trim();
-
-    const result = await searchYoutubeVideo(query);
-
-    if (!result?.url) {
-      throw new Error("No YouTube result found");
+    const startedAt = performance.now();
+    const query = originalUrl.replace("provider:spotify:", "").trim();
+    const cacheKey = spotifyMatchCacheKey(query, item.durationSec);
+    const cached = bypassCache ? null : getProviderMatch(cacheKey);
+    recordProviderMatchCache("spotify", Boolean(cached), startedAt);
+    if (cached) {
+      if (!canResolveItem(item, generation)) return false;
+      applyProviderMatch(item, cached);
+      return true;
     }
 
-    item.url = result.url;
-    item.title = item.title || result.title || query;
-    item.thumb = item.thumb || result.thumb || null;
-    item.durationSec = item.durationSec || result.durationSec || 0;
+    const searchQuery = /\bofficial\s+audio\b/i.test(query) ? query : `${query} official audio`;
+    const result = await searchYoutubeVideo(searchQuery, {
+      expectedDurationSec: item.durationSec,
+      limit: 6,
+      bypassCache,
+    });
+    if (!result?.url || !canResolveItem(item, generation)) return false;
 
+    applyProviderMatch(item, result);
+    setProviderMatch(cacheKey, result);
     return true;
   } catch (err) {
     console.error("[player] spotify resolve failed", err);
@@ -501,38 +553,136 @@ async function resolveSpotifyItem(item: QueueItem): Promise<boolean> {
   }
 }
 
-async function resolvePlaybackSource(
-  item: QueueItem
+type SourceOptions = { bypassCache?: boolean; skipDebugLabels?: string[] };
+
+function sourceOptions(item: QueueItem): SourceOptions {
+  if (!playbackRetries.has(item.id)) return {};
+  const label = attemptedSources.get(item.id)?.source.debugLabel;
+  return { bypassCache: true, skipDebugLabels: label ? [label] : [] };
+}
+
+async function extractSource(
+  url: string,
+  audioProfile: AudioProfileName,
+  options: SourceOptions
 ): Promise<PlayableSource | null> {
-  const preloadedSource = await consumePreloaded(item);
-  if (preloadedSource) {
-    console.log("[player] ⚡ Using preloaded audio");
-    return preloadedSource;
-  }
-
-  const normalized = normalizeUrl(item.url);
-
   try {
-    const resolved = await resolvePlayable(
-      normalized,
-      state.control.audioProfile
-    );
-    if (resolved) return resolved;
+    return await getPlayableSource(url, audioProfile, options);
   } catch (err) {
-    console.warn("[player] resolvePlayable failed, trying fallback", err);
+    console.warn("[player] playable source resolution failed", err);
+    return null;
+  }
+}
+
+async function resolveFreshItemSource(
+  item: QueueItem,
+  audioProfile: AudioProfileName
+): Promise<PlayableSource | null> {
+  const generation = engineGeneration;
+  const options = sourceOptions(item);
+  const originalUrl = item.sourceUrl || item.url;
+  if (isSoundCloudUrl(originalUrl)) {
+    return resolveSoundCloudSource(item, normalizeUrl(originalUrl), audioProfile, options);
   }
 
-  try {
-    const fallback = await getPlayableSource(
-      normalized,
-      state.control.audioProfile
-    );
-    if (fallback) return fallback;
-  } catch (err) {
-    console.warn("[player] getDirectPlayableUrl failed", err);
-  }
+  const source = await extractSource(normalizeUrl(item.url), audioProfile, options);
+  if (!canResolveItem(item, generation)) return null;
+  if (source) return source;
 
+  // A persisted provider match can outlive a removed/private YouTube video.
+  // Recover its original query and rematch instead of retrying that URL forever.
+  if (originalUrl.startsWith("provider:spotify:")) {
+    const query = originalUrl.replace("provider:spotify:", "").trim();
+    deleteProviderMatch(spotifyMatchCacheKey(query, item.durationSec));
+    if (!await resolveSpotifyItem(item, true) || !canResolveItem(item, generation)) return null;
+    return extractSource(normalizeUrl(item.url), audioProfile, options);
+  }
   return null;
+}
+
+async function resolvePlaybackSource(item: QueueItem): Promise<PlayableSource | null> {
+  if (!playbackRetries.has(item.id)) {
+    const preloadedSource = await consumePreloaded(item);
+    if (preloadedSource) {
+      console.log("[player] ⚡ Using preloaded audio");
+      return preloadedSource;
+    }
+  }
+  return resolveFreshItemSource(item, state.control.audioProfile);
+}
+
+async function resolveSoundCloudSource(
+  item: QueueItem,
+  originalUrl: string,
+  audioProfile: AudioProfileName,
+  options: SourceOptions
+): Promise<PlayableSource | null> {
+  const generation = engineGeneration;
+  const startedAt = performance.now();
+  const cacheKey = soundCloudFallbackCacheKey(originalUrl);
+  const cached = getProviderMatch(cacheKey);
+  recordProviderMatchCache("soundcloud", Boolean(cached), startedAt);
+
+  // Reuse learned matches, but retain the SoundCloud identity until a playable
+  // source is confirmed. A rejected match must still allow direct SC playback.
+  if (cached) {
+    const source = await extractSource(cached.url, audioProfile, options);
+    if (!canResolveItem(item, generation)) return null;
+    if (source) {
+      applyProviderMatch(item, cached);
+      return source;
+    }
+    deleteProviderMatch(cacheKey);
+  }
+
+  const direct = await extractSource(originalUrl, audioProfile, options);
+  if (!canResolveItem(item, generation)) return null;
+  if (direct) {
+    if (item.sourceUrl) item.url = originalUrl;
+    return direct;
+  }
+
+  return resolveSoundCloudFallbackSource(item, originalUrl, audioProfile, options, Boolean(cached));
+}
+
+async function resolveSoundCloudFallbackSource(
+  item: QueueItem,
+  originalUrl: string,
+  audioProfile: AudioProfileName,
+  options: SourceOptions,
+  bypassSearchCache: boolean
+): Promise<PlayableSource | null> {
+  const generation = engineGeneration;
+  try {
+    const metadata = await probeSingle(originalUrl);
+    if (!canResolveItem(item, generation)) return null;
+    const title = metadata.title?.trim();
+    const query = buildSoundCloudYoutubeQuery(title, originalUrl);
+    if (!query || query.toLowerCase() === "soundcloud") return null;
+
+    console.warn(`[player] SoundCloud fallback: searching YouTube for "${query}"`);
+    const found = await searchYoutubeVideo(query, {
+      expectedDurationSec: metadata.durationSec || item.durationSec,
+      limit: 8,
+      bypassCache: bypassSearchCache,
+    });
+    if (!found?.url || !canResolveItem(item, generation)) return null;
+    const source = await extractSource(found.url, audioProfile, options);
+    if (!source || !canResolveItem(item, generation)) return null;
+
+    const match: ProviderMatch = {
+      url: found.url,
+      title: title && title.toLowerCase() !== "soundcloud" ? title : found.title,
+      thumb: metadata.thumb || found.thumb || item.thumb,
+      durationSec: metadata.durationSec || found.durationSec || item.durationSec,
+    };
+    applyProviderMatch(item, match);
+    setProviderMatch(soundCloudFallbackCacheKey(originalUrl), match);
+    return source;
+  } catch (err) {
+    console.warn("[player] SoundCloud fallback failed", err);
+    return null;
+  }
 }
 
 /* ------------------- END TRACK ------------------- */
@@ -554,6 +704,7 @@ function handleEndOfTrack(item: QueueItem, onStateChange: () => void): void {
 
   item.status = "done";
   playbackRetries.delete(item.id);
+  attemptedSources.delete(item.id);
   cancelActiveAttempt();
   clearPreloadForItem(item.id);
   queueService.addToHistory(item);
@@ -569,7 +720,7 @@ function recoverPlayback(item: QueueItem, onStateChange: () => void): void {
   const retries = playbackRetries.get(item.id) || 0;
   if (retries < MAX_PLAYBACK_RETRIES) {
     playbackRetries.set(item.id, retries + 1);
-    invalidatePlayableSource(item.url, state.control.audioProfile);
+    invalidatePlayableSource(attemptedSources.get(item.id)?.pageUrl || item.url, state.control.audioProfile);
     item.status = "queued";
     preferredNextItem = item;
     console.warn(`[player] Nouvelle tentative avec une source fraîche : ${item.title || item.id}`);
@@ -577,6 +728,7 @@ function recoverPlayback(item: QueueItem, onStateChange: () => void): void {
   } else {
     item.status = "error";
     playbackRetries.delete(item.id);
+    attemptedSources.delete(item.id);
     console.error(`[player] Piste abandonnée après deux échecs : ${item.title || item.id}`);
     recordDiagnostic("PLAYBACK_ABANDONED", { trackId: item.id, attempt: retries + 1 });
   }
@@ -687,6 +839,7 @@ export async function skip(onStateChange: () => void): Promise<void> {
 
   currentItem.status = "done";
   playbackRetries.delete(currentItem.id);
+  attemptedSources.delete(currentItem.id);
   cancelActiveAttempt();
   clearPreloadForItem(currentItem.id);
   queueService.addToHistory(currentItem);
@@ -746,7 +899,10 @@ export async function playPrevious(onStateChange: () => void): Promise<void> {
   const currentItem = playing?.item || activeItem;
   const previousClone = queueService.restorePrevious(currentItem);
   if (!previousClone) return;
-  if (currentItem) playbackRetries.delete(currentItem.id);
+  if (currentItem) {
+    playbackRetries.delete(currentItem.id);
+    attemptedSources.delete(currentItem.id);
+  }
 
   cancelActiveAttempt();
   preferredNextItem = previousClone;
@@ -788,6 +944,7 @@ export async function stopPlayer(onStateChange: () => void): Promise<void> {
   preloaded.clear();
   preloading.clear();
   playbackRetries.clear();
+  attemptedSources.clear();
   preferredNextItem = null;
   if (activeItem?.status === "playing") activeItem.status = "done";
   resetNowState();

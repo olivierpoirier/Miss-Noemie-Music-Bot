@@ -27,11 +27,11 @@ export default function ThemedPanel({
         !noBorder && "border",
         soft
           ? isAdventurer
-            ? "organic-panel-soft border-[#d5c5a1]/15"
-            : "rounded-xl bg-panel border-slate-700"
+            ? "organic-panel-soft themed-soft-surface-border"
+            : "rounded-[var(--ui-card-radius)] bg-panel themed-soft-surface-border"
           : isAdventurer
-          ? "organic-panel border-[#d5c5a1]/15"
-          : "rounded-xl bg-bg/80 backdrop-blur-xl border-slate-800",
+          ? "organic-panel themed-surface-border"
+          : "rounded-[var(--ui-panel-radius)] bg-bg/80 backdrop-blur-xl themed-surface-border",
         rainbow && "rainbow-cycle",
         className
       )}

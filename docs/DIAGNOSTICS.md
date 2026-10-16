@@ -42,6 +42,10 @@ Le journal se trouve par défaut dans `.data/logs/events.ndjson`. Il est ignoré
 
 L'API `GET /diagnostics` renvoie le même relevé public et ne lance aucune lecture. Le backend reste accessible avec l'option `VITE_API_BASE`, ou à l'adresse configurée par `VITE_SERVER_URL`; le développement local utilise le proxy Vite. La démo Vercel indique que ces outils ne sont disponibles que dans l'application locale.
 
+`GET /metrics` fournit les 100 dernières mesures d'opérations du backend, avec leur durée et leur résultat. Ces mesures sont conservées uniquement en mémoire; elles complètent les événements persistants sans les remplacer.
+
+Le cache `backend/.data/provider-match-cache.json` conserve les correspondances vers des pages publiques YouTube/SoundCloud entre les redémarrages, avec une validité de 24 heures par défaut. Il exclut les flux audio temporaires ou signés. Les variables `PLAYER_PROVIDER_MATCH_CACHE_PATH`, `PLAYER_PROVIDER_MATCH_CACHE_MAX` et `PLAYER_PROVIDER_MATCH_CACHE_TTL_MS` permettent d'ajuster le chemin, la taille et la durée de validité.
+
 L'état de la file et l'historique musical restent en mémoire : ce journal conserve les incidents, pas une sauvegarde des morceaux. Une fréquence supposée de deux semaines ne peut être confirmée qu'en comparant les événements enregistrés aux dates des interruptions.
 
 ## Modules communs

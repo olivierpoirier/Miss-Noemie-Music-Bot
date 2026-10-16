@@ -1,15 +1,19 @@
 import { spawn } from "child_process";
 import play from "play-dl";
+import { performance } from "node:perf_hooks";
+import { recordBackendMetric } from "./metrics.js";
 import { recordDiagnostic, diagnosticErrorDetails } from "./diagnostics.js";
 import { resolveSpotifyUrl, SpotifyResolverError } from "./spotify.js";
 
-import { YTDLP_CONFIG } from "./config.js";
+import { MPV_CONFIG, YTDLP_CONFIG } from "./config.js";
 import { ProbeResult, ResolvedItem } from "./types.js";
 import {
   getMediaPlatform,
   isDirectMediaUrl,
   isPlaylistUrl,
   isSoundCloudUrl,
+  isSoundCloudSetUrl,
+  isSoundCloudShortUrl,
   isSpotifyUrl,
   isYoutubeSearchUrl,
   isYoutubeUrl,
@@ -47,6 +51,9 @@ export type PlayableSource = {
 const DIRECT_CACHE = new Map<string, CacheVal<PlayableSource>>();
 const DIRECT_PENDING = new Map<string, Promise<PlayableSource | null>>();
 const FLAT_CACHE = new Map<string, CacheVal<ResolvedItem[]>>();
+const YOUTUBE_SEARCH_CACHE = new Map<string, CacheVal<ResolvedItem>>();
+const SEARCH_PENDING = new Map<string, Promise<ResolvedItem | null>>();
+const SOUNDCLOUD_EXPAND_CACHE = new Map<string, CacheVal<string>>();
 
 const PLAY_DL_TIMEOUT_MS = 10_000;
 
@@ -365,49 +372,334 @@ function mapYoutubeSearchResult(data: any, query: string): ResolvedItem | null {
   };
 }
 
-export async function searchYoutubeVideo(
-  query: string
-): Promise<ResolvedItem | null> {
-  const trimmed = query.trim();
-  if (!trimmed) return null;
+export function buildSoundCloudYoutubeQuery(
+  title?: string | null,
+  url?: string | null
+): string {
+  const fallbackTitle = title?.trim() || "";
+  const cleanedTitle = fallbackTitle
+    .replace(/^stream\s+/i, "")
+    .replace(/\s*\|\s*listen online for free on soundcloud\s*$/i, "")
+    .replace(/\s+on\s+soundcloud\s*$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
 
-  try {
-    const results = await withDeadline(play.search(trimmed, {
-      limit: 1,
-      source: { youtube: "video" },
-    }), "YouTube search");
-
-    const item = mapYoutubeSearchResult(results[0], trimmed);
-    if (item) return item;
-  } catch (err) {
-    console.warn("[youtube search] play-dl failed; trying yt-dlp", err);
+  const byMatch = cleanedTitle.match(/^(.+?)\s+by\s+(.+?)$/i);
+  if (byMatch?.[1] && byMatch?.[2] && !cleanedTitle.includes(" - ")) {
+    return `${byMatch[2].trim()} - ${byMatch[1].trim()}`;
   }
 
-  const searchUrl = `ytsearch1:${trimmed}`;
+  if (cleanedTitle && cleanedTitle.toLowerCase() !== "soundcloud") return cleanedTitle;
+
+  if (!url) return fallbackTitle || "SoundCloud";
 
   try {
-    const json = await runYtDlp(
-      searchUrl,
-      ["--dump-single-json", "--no-playlist", searchUrl],
-      { useCookies: true }
-    );
+    const parsed = new URL(url);
+    const parts = parsed.pathname
+      .split("/")
+      .filter(Boolean)
+      .map((part) =>
+        decodeURIComponent(part)
+          .replace(/[-_]+/g, " ")
+          .replace(/\s+/g, " ")
+          .trim()
+      )
+      .filter(Boolean);
 
-    const data = JSON.parse(json);
-    const first = Array.isArray(data?.entries) ? data.entries[0] : data;
-    const item = mapYoutubeSearchResult(first, trimmed);
+    if (parts.length >= 2) return `${parts[0]} - ${parts[1]}`;
+    return parts[0] || fallbackTitle || "SoundCloud";
+  } catch {
+    return fallbackTitle || "SoundCloud";
+  }
+}
 
-    if (item) return item;
+async function fetchJsonWithTimeout<T>(
+  url: string,
+  timeoutMs: number
+): Promise<T> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const startedAt = performance.now();
+
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        accept: "application/json",
+        "user-agent": MPV_CONFIG.userAgent,
+      },
+    });
+
+    recordBackendMetric("fetch-json", performance.now() - startedAt, res.ok, {
+      platform: getMediaPlatform(url),
+      status: res.status,
+    });
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    return (await res.json()) as T;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function expandSoundCloudShortUrl(normalized: string): Promise<string> {
+  if (!isSoundCloudShortUrl(normalized)) return normalized;
+
+  const cached = cacheGet(SOUNDCLOUD_EXPAND_CACHE, normalized);
+  if (cached) return cached;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    YTDLP_CONFIG.soundCloudMetadataTimeoutMs
+  );
+  const startedAt = performance.now();
+
+  try {
+    const res = await fetch(normalized, {
+      signal: controller.signal,
+      redirect: "follow",
+      headers: {
+        accept: "text/html,application/xhtml+xml",
+        "user-agent": MPV_CONFIG.userAgent,
+      },
+    });
+
+    await res.body?.cancel().catch(() => {});
+
+    const finalUrl =
+      typeof res.url === "string" && isSoundCloudUrl(res.url)
+        ? normalizeUrl(res.url)
+        : normalized;
+
+    recordBackendMetric("soundcloud-expand", performance.now() - startedAt, true, {
+      changed: finalUrl !== normalized,
+      status: res.status,
+    });
+
+    cacheSet(SOUNDCLOUD_EXPAND_CACHE, normalized, finalUrl);
+    return finalUrl;
   } catch (err) {
-    console.warn("[youtube search] yt-dlp failed", err);
+    recordBackendMetric("soundcloud-expand", performance.now() - startedAt, false, {
+      changed: false,
+    });
+    console.warn("[soundcloud expand failed]", err);
+    return normalized;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function resolveSoundCloudOEmbed(
+  normalized: string
+): Promise<ProbeResult | null> {
+  const expanded = await expandSoundCloudShortUrl(normalized);
+  const candidates =
+    expanded === normalized ? [normalized] : [expanded, normalized];
+
+  for (const candidate of candidates) {
+    try {
+      const data = await fetchJsonWithTimeout<{
+        title?: string;
+        thumbnail_url?: string;
+      }>(
+        `https://soundcloud.com/oembed?format=json&url=${encodeURIComponent(
+          candidate
+        )}`,
+        YTDLP_CONFIG.soundCloudMetadataTimeoutMs
+      );
+
+      const title = cleanText(data.title);
+      if (!title) continue;
+
+      return {
+        title,
+        thumb: cleanText(data.thumbnail_url) || buildFallbackThumb(title, candidate),
+        durationSec: 0,
+      };
+    } catch (err) {
+      console.warn("[soundcloud oembed failed]", err);
+    }
   }
 
   return null;
+}
+
+export type YoutubeSearchOptions = {
+  expectedDurationSec?: number | null;
+  limit?: number;
+  bypassCache?: boolean;
+};
+
+function normalizeSearchText(value: string): string[] {
+  return value
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function scoreYoutubeCandidate(
+  item: ResolvedItem,
+  query: string,
+  expectedDurationSec?: number | null
+): number {
+  let score = 0;
+  const title = item.title || "";
+  const titleTokens = new Set(normalizeSearchText(title));
+  const queryTokens = normalizeSearchText(query);
+
+  for (const token of queryTokens) {
+    if (titleTokens.has(token)) score += 4;
+  }
+
+  const loweredTitle = title.toLowerCase();
+  const loweredQuery = query.toLowerCase();
+  const noisyTerms = [
+    "live",
+    "remix",
+    "cover",
+    "karaoke",
+    "instrumental",
+    "lyrics",
+    "paroles",
+    "slowed",
+    "sped up",
+    "nightcore",
+    "reaction",
+  ];
+
+  for (const term of noisyTerms) {
+    const containsTerm = (text: string) => (` ${normalizeSearchText(text).join(" ")} `).includes(` ${term} `);
+    if (containsTerm(loweredTitle) && !containsTerm(loweredQuery)) {
+      score -= 12;
+    }
+  }
+
+  if (loweredTitle.includes("official audio")) score += 8;
+  if (loweredTitle.includes("official video")) score += 5;
+  if (loweredTitle.includes("topic")) score += 4;
+
+  if (expectedDurationSec && item.durationSec) {
+    const diff = Math.abs(item.durationSec - expectedDurationSec);
+    if (diff <= 2) score += 30;
+    else if (diff <= 5) score += 22;
+    else if (diff <= 10) score += 12;
+    else if (diff <= 20) score += 4;
+    else score -= Math.min(30, Math.floor(diff / 5));
+  }
+
+  return score;
+}
+
+function pickBestYoutubeSearchResult(
+  candidates: ResolvedItem[],
+  query: string,
+  expectedDurationSec?: number | null
+): ResolvedItem | null {
+  if (!candidates.length) return null;
+
+  return candidates
+    .map((item) => ({
+      item,
+      score: scoreYoutubeCandidate(item, query, expectedDurationSec),
+    }))
+    .sort((a, b) => b.score - a.score)[0]?.item ?? null;
+}
+
+export async function searchYoutubeVideo(
+  query: string,
+  options: YoutubeSearchOptions = {}
+): Promise<ResolvedItem | null> {
+  const trimmed = query.trim();
+  if (!trimmed) return null;
+  const limit = Math.max(1, Math.min(Math.floor(options.limit || 5), 10));
+  const startedAt = performance.now();
+  const cacheKey = [
+    normalizeSearchText(trimmed).join(" "),
+    limit,
+    Math.round(options.expectedDurationSec || 0),
+  ].join("|");
+  const resolutionKey = options.bypassCache ? `${cacheKey}\0fresh` : cacheKey;
+  if (options.bypassCache) {
+    YOUTUBE_SEARCH_CACHE.delete(cacheKey);
+    SEARCH_PENDING.delete(cacheKey);
+  }
+  const cached = cacheGet(YOUTUBE_SEARCH_CACHE, cacheKey);
+  if (cached) {
+    recordBackendMetric("youtube-search", performance.now() - startedAt, true, {
+      source: "cache", limit, expectedDuration: Boolean(options.expectedDurationSec),
+    });
+    return { ...cached };
+  }
+  const pending = SEARCH_PENDING.get(resolutionKey);
+  if (pending) {
+    const result = await pending;
+    return result ? { ...result } : null;
+  }
+
+  const task = (async (): Promise<ResolvedItem | null> => {
+    const finish = (
+      item: ResolvedItem | null,
+      source: "play-dl" | "yt-dlp" | "none"
+    ): ResolvedItem | null => {
+      recordBackendMetric("youtube-search", performance.now() - startedAt, Boolean(item), {
+        source, limit, expectedDuration: Boolean(options.expectedDurationSec),
+      });
+      if (!item) return null;
+      if (SEARCH_PENDING.get(resolutionKey) === task) {
+        cacheSet(YOUTUBE_SEARCH_CACHE, cacheKey, { ...item }, Date.now() + YTDLP_CONFIG.searchCacheTTLMs);
+      }
+      return { ...item };
+    };
+    try {
+      const results = await withDeadline(play.search(trimmed, {
+        limit, source: { youtube: "video" },
+      }), "YouTube search");
+      const candidates = results.map((result) => mapYoutubeSearchResult(result, trimmed))
+        .filter((item): item is ResolvedItem => Boolean(item));
+      const item = pickBestYoutubeSearchResult(candidates, trimmed, options.expectedDurationSec);
+      if (item) return finish(item, "play-dl");
+    } catch (err) {
+      console.warn("[youtube search] play-dl failed; trying yt-dlp", err);
+    }
+
+    try {
+      const searchUrl = `ytsearch${limit}:${trimmed}`;
+      const json = await runYtDlp(searchUrl, ["--dump-single-json", "--no-playlist", searchUrl], { useCookies: true });
+      const data = JSON.parse(json);
+      const entries: unknown[] = Array.isArray(data?.entries) ? data.entries : [data];
+      const candidates = entries.map((entry) => mapYoutubeSearchResult(entry, trimmed))
+        .filter((item): item is ResolvedItem => Boolean(item));
+      const item = pickBestYoutubeSearchResult(candidates, trimmed, options.expectedDurationSec);
+      if (item) return finish(item, "yt-dlp");
+    } catch (err) {
+      console.warn("[youtube search] yt-dlp failed", err);
+    }
+    return finish(null, "none");
+  })();
+  SEARCH_PENDING.set(resolutionKey, task);
+  try {
+    const result = await task;
+    return result ? { ...result } : null;
+  } finally {
+    if (SEARCH_PENDING.get(resolutionKey) === task) SEARCH_PENDING.delete(resolutionKey);
+  }
 }
 
 async function resolveSoundCloudItems(
   normalized: string
 ): Promise<ResolvedItem[] | null> {
   if (!isSoundCloudUrl(normalized)) return null;
+  if (!isSoundCloudSetUrl(normalized) && !isSoundCloudShortUrl(normalized)) {
+    return null;
+  }
 
   try {
     const json = await runYtDlp(
@@ -420,7 +712,10 @@ async function resolveSoundCloudItems(
         "200",
         normalized,
       ],
-      { useCookies: false }
+      {
+        useCookies: false,
+        timeoutMs: YTDLP_CONFIG.soundCloudMetadataTimeoutMs,
+      }
     );
 
     const data = JSON.parse(json);
@@ -504,6 +799,13 @@ async function runYtDlp(
 ): Promise<string> {
   const finalArgs = buildYtDlpArgs(url, extraArgs, opts);
   const startedAt = Date.now();
+  const record = (ok: boolean, data: Record<string, unknown> = {}) => {
+    recordBackendMetric("yt-dlp", Date.now() - startedAt, ok, {
+      platform: getMediaPlatform(url),
+      mode: extraArgs.includes("-J") ? "playlist" : extraArgs.includes("--dump-single-json") ? "json" : "other",
+      ...data,
+    });
+  };
 
   return new Promise((resolve, reject) => {
     console.log(`[yt-dlp] ${YTDLP_CONFIG.bin} ${finalArgs.join(" ")}`);
@@ -523,6 +825,7 @@ async function runYtDlp(
       finished = true;
 
       killProcessTree(proc);
+      record(false, { timeout: true });
       recordDiagnostic("YTDLP_TIMEOUT", { durationMs: Date.now() - startedAt, reason: "timeout" });
 
       if (err.trim()) {
@@ -540,6 +843,7 @@ async function runYtDlp(
         clearTimeout(timeout);
         killProcessTree(proc);
         recordDiagnostic("YTDLP_PROCESS_FAILED", { durationMs: Date.now() - startedAt });
+        record(false, { outputLimit: true });
         reject(new Error("yt-dlp output exceeded 32 MiB"));
       }
     });
@@ -553,6 +857,7 @@ async function runYtDlp(
       finished = true;
       clearTimeout(timeout);
       recordDiagnostic("YTDLP_PROCESS_FAILED", { ...diagnosticErrorDetails(spawnErr), durationMs: Date.now() - startedAt });
+      record(false, { spawnError: true });
       reject(spawnErr);
     });
 
@@ -562,8 +867,10 @@ async function runYtDlp(
       clearTimeout(timeout);
 
       if (code === 0) {
+        record(true);
         resolve(out.trim());
       } else {
+        record(false, { exitCode: code });
         recordDiagnostic("YTDLP_PROCESS_FAILED", { ...diagnosticErrorDetails(new Error(err)), durationMs: Date.now() - startedAt });
         if (err.trim()) {
           console.error("[yt-dlp error]", err);
@@ -721,6 +1028,14 @@ export async function probeSingle(url: string): Promise<ProbeResult> {
     return res;
   }
 
+  if (isSoundCloudUrl(normalized)) {
+    const oembed = await resolveSoundCloudOEmbed(normalized);
+    if (oembed) {
+      cacheSet(PROBE_CACHE, normalized, oembed);
+      return oembed;
+    }
+  }
+
   if (play.yt_validate(normalized) === "video") {
     try {
       const info = await withDeadline(play.video_info(normalized), "YouTube metadata");
@@ -744,7 +1059,12 @@ export async function probeSingle(url: string): Promise<ProbeResult> {
     const json = await runYtDlp(
       normalized,
       ["--dump-single-json", "--no-playlist", normalized],
-      { useCookies: true }
+      {
+        useCookies: true,
+        timeoutMs: isSoundCloudUrl(normalized)
+          ? YTDLP_CONFIG.soundCloudMetadataTimeoutMs
+          : undefined,
+      }
     );
 
     const data = JSON.parse(json);
@@ -839,6 +1159,14 @@ type PlaybackExtractionAttempt = {
   youtubePlayerClient?: string | null;
 };
 
+export type PlayableSourceOptions = {
+  bypassCache?: boolean;
+  skipDebugLabels?: string[];
+};
+
+const YOUTUBE_AUDIO_FIRST_FORMAT =
+  "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best";
+
 const YOUTUBE_BALANCED_QUALITY_FORMAT =
   "best[ext=mp4][height<=720]/best[ext=mp4][height<=480]/18/bestaudio/best";
 
@@ -846,6 +1174,10 @@ function getPlaybackExtractionAttempts(
   url: string,
   audioProfile?: AudioProfileName | null
 ): PlaybackExtractionAttempt[] {
+  if (isSoundCloudUrl(url)) {
+    return [{ label: "soundcloud-bestaudio", format: "bestaudio/best", useCookies: false }];
+  }
+
   if (!isYoutubeUrl(url)) {
     return [
       {
@@ -882,13 +1214,13 @@ function getPlaybackExtractionAttempts(
   const bestAudioAttempts: PlaybackExtractionAttempt[] = [
     {
       label: "youtube-bestaudio-cookies",
-      format: "bestaudio/best",
+      format: YOUTUBE_AUDIO_FIRST_FORMAT,
       useCookies: true,
       youtubePlayerClient: defaultClient,
     },
     {
       label: "youtube-bestaudio-public",
-      format: "bestaudio/best",
+      format: YOUTUBE_AUDIO_FIRST_FORMAT,
       useCookies: false,
       youtubePlayerClient: defaultClient,
     },
@@ -912,15 +1244,15 @@ function getPlaybackExtractionAttempts(
   const attempts =
     profile === "xbox"
       ? [
-          safeAttempts[0],
           bestAudioAttempts[0],
+          safeAttempts[0],
           safeAttempts[1],
           bestAudioAttempts[1],
         ]
       : [
-          qualityAttempts[0],
           bestAudioAttempts[0],
           safeAttempts[0],
+          qualityAttempts[0],
           qualityAttempts[1],
           bestAudioAttempts[1],
           safeAttempts[1],
@@ -957,13 +1289,18 @@ export function invalidatePlayableSource(
     : [getPlayableSourceCacheKey(normalized, audioProfile)];
   for (const key of keys) {
     DIRECT_CACHE.delete(key);
-    DIRECT_PENDING.delete(key);
+    for (const pendingKey of DIRECT_PENDING.keys()) {
+      if (pendingKey === key || pendingKey.startsWith(`${key}\0`)) {
+        DIRECT_PENDING.delete(pendingKey);
+      }
+    }
   }
 }
 
 export async function getPlayableSource(
   url: string,
-  audioProfile?: AudioProfileName | null
+  audioProfile?: AudioProfileName | null,
+  options: PlayableSourceOptions = {}
 ): Promise<PlayableSource | null> {
   if (url.startsWith("provider:")) return null;
 
@@ -979,13 +1316,27 @@ export async function getPlayableSource(
   }
 
   const cacheKey = getPlayableSourceCacheKey(normalized, audioProfile);
+  const skippedLabels = new Set(options.skipDebugLabels || []);
+  const resolutionKey = options.bypassCache || skippedLabels.size
+    ? `${cacheKey}\0fresh:${[...skippedLabels].sort().join(",")}`
+    : cacheKey;
+  if (options.bypassCache) {
+    DIRECT_CACHE.delete(cacheKey);
+    // An older extraction must not restore the rejected signed URL in cache.
+    DIRECT_PENDING.delete(cacheKey);
+  }
   const cached = cacheGet(DIRECT_CACHE, cacheKey);
-  if (cached) return cached;
-  const pending = DIRECT_PENDING.get(cacheKey);
+  if (cached && !skippedLabels.has(cached.debugLabel || "")) return cached;
+  const pending = DIRECT_PENDING.get(resolutionKey);
   if (pending) return pending;
 
   const task: Promise<PlayableSource | null> = (async () => {
-    const deadline = Date.now() + YTDLP_CONFIG.processTimeoutMs;
+    const deadline = Date.now() + Math.min(
+      YTDLP_CONFIG.processTimeoutMs,
+      isSoundCloudUrl(normalized)
+        ? YTDLP_CONFIG.soundCloudPlaybackTimeoutMs
+        : YTDLP_CONFIG.processTimeoutMs
+    );
 
     const tryOnce = async (
       attempt: PlaybackExtractionAttempt
@@ -1011,7 +1362,7 @@ export async function getPlayableSource(
 
         if (source) {
           recordDiagnostic("YTDLP_SOURCE_RESOLVED");
-          if (DIRECT_PENDING.get(cacheKey) === task && (source.expiresAt ?? 0) > Date.now()) {
+          if (DIRECT_PENDING.get(resolutionKey) === task && (source.expiresAt ?? 0) > Date.now()) {
             cacheSet(DIRECT_CACHE, cacheKey, source, source.expiresAt);
           }
           console.log(
@@ -1036,6 +1387,7 @@ export async function getPlayableSource(
       audioProfile
     )) {
       if (Date.now() >= deadline) break;
+      if (skippedLabels.has(attempt.label)) continue;
       const source = await tryOnce(attempt);
       if (source) return source;
     }
@@ -1043,11 +1395,11 @@ export async function getPlayableSource(
     return null;
   })();
 
-  DIRECT_PENDING.set(cacheKey, task);
+  DIRECT_PENDING.set(resolutionKey, task);
   try {
     return await task;
   } finally {
-    if (DIRECT_PENDING.get(cacheKey) === task) DIRECT_PENDING.delete(cacheKey);
+    if (DIRECT_PENDING.get(resolutionKey) === task) DIRECT_PENDING.delete(resolutionKey);
   }
 }
 

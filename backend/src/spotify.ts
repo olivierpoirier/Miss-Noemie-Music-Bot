@@ -1,3 +1,5 @@
+import { performance } from "node:perf_hooks";
+import { recordBackendMetric } from "./metrics.js";
 import type { ResolvedItem } from "./types.js";
 import { recordDiagnostic, diagnosticErrorDetails } from "./diagnostics.js";
 import { isSpotifyUrl } from "./platforms/spotify.js";
@@ -237,47 +239,57 @@ async function spotifyGet<T>(url: string): Promise<T> {
   endpoint.searchParams.set("market", /^[A-Z]{2}$/.test(market) ? market : "FR");
   const requestUrl = endpoint.toString();
 
-  let accessToken = await refreshSpotifyAccessToken();
-  let result = await spotifyRequest(requestUrl, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
-
-  // Retry a rejected token once, including when Spotify revokes it before expiry.
-  if (result.response.status === 401) {
-    recordDiagnostic("SPOTIFY_TOKEN_REJECTED", { status: 401 });
-    accessToken = await refreshSpotifyAccessToken(accessToken);
-    result = await spotifyRequest(requestUrl, {
+  const startedAt = performance.now();
+  let ok = false;
+  try {
+    let accessToken = await refreshSpotifyAccessToken();
+    let result = await spotifyRequest(requestUrl, {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
-  }
-  const { response: res, body } = result;
 
-  if (!res.ok) {
-    recordDiagnostic("SPOTIFY_REQUEST_FAILED", { status: res.status });
-    if (res.status === 404) {
+    // Retry a rejected token once, including when Spotify revokes it before expiry.
+    if (result.response.status === 401) {
+      recordDiagnostic("SPOTIFY_TOKEN_REJECTED", { status: 401 });
+      accessToken = await refreshSpotifyAccessToken(accessToken);
+      result = await spotifyRequest(requestUrl, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+    }
+    const { response: res, body } = result;
+
+    if (!res.ok) {
+      recordDiagnostic("SPOTIFY_REQUEST_FAILED", { status: res.status });
+      if (res.status === 404) {
+        throw new SpotifyResolverError(
+          "SPOTIFY_RESOURCE_NOT_FOUND",
+          "La ressource Spotify est introuvable ou inaccessible.",
+          res.status
+        );
+      }
+
+      if (res.status === 429) {
+        throw new SpotifyResolverError(
+          "SPOTIFY_RATE_LIMITED",
+          "Spotify limite temporairement les requêtes ou le quota de l'application est atteint. Réessaie plus tard.",
+          res.status
+        );
+      }
+
       throw new SpotifyResolverError(
-        "SPOTIFY_RESOURCE_NOT_FOUND",
-        "La ressource Spotify est introuvable ou inaccessible.",
+        "SPOTIFY_GET_FAILED",
+        `Spotify GET failed: ${res.status}`,
         res.status
       );
     }
 
-    if (res.status === 429) {
-      throw new SpotifyResolverError(
-        "SPOTIFY_RATE_LIMITED",
-        "Spotify limite temporairement les requêtes ou le quota de l'application est atteint. Réessaie plus tard.",
-        res.status
-      );
-    }
-
-    throw new SpotifyResolverError(
-      "SPOTIFY_GET_FAILED",
-      `Spotify GET failed: ${res.status}`,
-      res.status
-    );
+    const parsed = JSON.parse(body) as T;
+    ok = true;
+    return parsed;
+  } finally {
+    recordBackendMetric("spotify-get", performance.now() - startedAt, ok, {
+      endpoint: endpoint.pathname.replace(/\/[A-Za-z0-9]{10,}/g, "/:id"),
+    });
   }
-
-  return JSON.parse(body) as T;
 }
 
 function parseSpotifyUrl(

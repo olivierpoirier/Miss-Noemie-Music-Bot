@@ -61,13 +61,65 @@ Lance le bot complet avec backend local, frontend et tunnel Cloudflare:
 npm run dev
 ```
 
+Pour le moment, c'est le mode de partage recommandé: Cloudflare donne une URL random `trycloudflare.com` gratuite à chaque lancement, sans domaine acheté.
+
 Lance seulement en local, sans tunnel:
 
 ```bash
 npm run dev:local
 ```
 
-Le backend répond sur `http://localhost:4000`. Le frontend démarre sur `http://localhost:5173` ou sur le prochain port libre. Quand le tunnel est actif, partage l'URL `trycloudflare.com` affichée dans le terminal.
+Lance avec un tunnel Cloudflare nommé/stable après la configuration initiale, seulement si tu possèdes un domaine:
+
+```bash
+npm run dev:stable-tunnel
+```
+
+Le backend répond sur `http://localhost:4000`. Le frontend démarre sur `http://localhost:5173` ou sur le prochain port libre. Avec le quick tunnel, partage l'URL `trycloudflare.com` affichée dans le terminal; avec le tunnel stable, partage le hostname Cloudflare configuré.
+
+## Tunnel Cloudflare
+
+Le mode recommandé sans domaine acheté est:
+
+```bash
+npm run dev
+```
+
+Il utilise un quick tunnel `trycloudflare.com`; son URL change à chaque nouveau tunnel, mais c'est gratuit et suffisant pour partager temporairement l'app.
+
+Pour partager une adresse fixe à un groupe, il faut posséder un domaine, créer un tunnel nommé et l'associer à un hostname Cloudflare.
+
+Une seule fois:
+
+```bash
+npm run tunnel:login
+npm run tunnel:create
+npm run tunnel:route -- miss-noemie-music-bot.com
+```
+
+Remplace `miss-noemie-music-bot.com` par ton vrai hostname Cloudflare si tu changes de domaine. Ensuite, lance l'app avec:
+
+```bash
+npm run dev:stable-tunnel
+```
+
+Par défaut, le tunnel nommé s'appelle `music-bot`. Pour utiliser un autre nom, définis `CLOUDFLARE_TUNNEL_NAME` avant de lancer `npm run dev:stable-tunnel`.
+
+Autorise les noms d'hôte de tes domaines personnalisés dans `frontend/.env.local`, séparés par des virgules, puis relance le lanceur:
+
+```dotenv
+VITE_ALLOWED_HOSTS=music.example.com,autre.example.com
+```
+
+Utilise des noms d'hôte sans protocole ni chemin. Les adresses locales et les quick tunnels `trycloudflare.com` restent autorisés par défaut.
+
+La restriction facultative `BACKEND_ALLOWED_ORIGINS` se configure dans `backend/.env` avec des origines complètes, par exemple `https://music.example.com,http://localhost:5173`. Elle contrôle les origines HTTP/Socket.IO; `VITE_ALLOWED_HOSTS` contrôle les hôtes acceptés par le serveur de développement Vite. Adapte aussi cette liste si l'URL du tunnel ou le port du frontend change.
+
+Configuration de référence des notes Windows du 20 août 2026:
+
+- tunnel Cloudflare nommé: `music-bot`
+- hostname stable prévu: `https://miss-noemie-music-bot.com`
+- le domaine custom reste optionnel tant qu'on ne veut pas acheter/configurer un domaine; utilise `npm run dev` pour rester sur une URL random gratuite.
 
 ## Prérequis audio
 
@@ -91,6 +143,7 @@ npm run build:frontend:vercel
 npm test
 npm run lint
 npm run doctor
+npm run update:ytdlp
 ```
 
 Le build local du frontend écrit dans `frontend/dist`, qui est servi par le backend local. Le build Vercel écrit dans `frontend/dist-vercel` pour garder la démo séparée du vrai mode local.
@@ -120,6 +173,8 @@ Cette séparation est importante: le mode local doit continuer à servir `fronte
 |-- backend/src/queue.ts                # Mutations de la file et de l'historique
 |-- backend/src/diagnostics.ts          # Journal persistant et événements bornés
 |-- backend/src/toolDiagnostics.ts      # Vérification des exécutables utilisés
+|-- backend/src/providerCache.ts        # Cache persistant de correspondances entre fournisseurs
+|-- backend/src/metrics.ts              # Mesures récentes des opérations du backend
 |-- backend/src/mpv.ts                  # Pilotage mpv et profils audio
 |-- backend/src/platforms/              # Détection YouTube, SoundCloud, Spotify, Twitch, direct
 |-- frontend/src/App.tsx                # Composition de l'interface
@@ -133,13 +188,20 @@ Cette séparation est importante: le mode local doit continuer à servir `fronte
 
 | Variable | Rôle |
 | --- | --- |
-| `PORT` | Port du backend (4000 par défaut); le lanceur configure aussi le proxy Vite. |
+| `PORT` | Port du backend (4000 par défaut). Avec le lanceur, passe-le dans son environnement (`PORT=4001 npm run dev:local`) pour synchroniser le backend et le proxy Vite. |
+| `CLOUDFLARE_TUNNEL_NAME` | Nom du tunnel Cloudflare utilisé par `dev:stable-tunnel`, `music-bot` par défaut. |
+| `VITE_ALLOWED_HOSTS` | Noms d'hôte supplémentaires acceptés par Vite, séparés par des virgules; à définir dans `frontend/.env.local` ou l'environnement du lanceur. |
+| `BACKEND_ALLOWED_ORIGINS` | Origines HTTP/Socket.IO autorisées, séparées par des virgules; une liste vide conserve le partage sans restriction d'origine. |
 | `IDLE_SHUTDOWN_MS` | Délai d'arrêt après la déconnexion de tous les clients. Désactivé par défaut (`0`); `60000` rétablit l'ancien arrêt après une minute. |
 | `MPV_BIN` | Chemin personnalisé vers `mpv`. |
 | `AUDIO_PROFILE` | Profil audio par défaut: `balanced` ou `xbox`. |
 | `WINDOWS_MPV_AUDIO_DEVICE` | Périphérique audio Windows utilisé par `mpv`. |
 | `VOICEMEETER_PATH` | Chemin vers VoiceMeeter sur Windows. |
 | `YTDLP_COOKIES_PATH` | Fichier cookies pour aider la résolution YouTube. |
+| `YTDLP_BIN` | Exécutable yt-dlp personnalisé; sinon, le bot privilégie la copie installée dans le backend. |
+| `PLAYER_PROVIDER_MATCH_CACHE_PATH` | Fichier du cache des correspondances, `backend/.data/provider-match-cache.json` par défaut. |
+| `PLAYER_PROVIDER_MATCH_CACHE_MAX` | Nombre maximal de correspondances conservées, 1000 par défaut, plafonné à 10000. |
+| `PLAYER_PROVIDER_MATCH_CACHE_TTL_MS` | Durée de validité d'une correspondance, 24 heures par défaut, plafonnée à 7 jours. |
 | `SPOTIFY_CLIENT_ID` | Identifiant Spotify, si les liens Spotify sont utilisés. |
 | `SPOTIFY_CLIENT_SECRET` | Secret Spotify. |
 | `SPOTIFY_REFRESH_TOKEN` | Autorisation utilisateur Spotify. Les titres et albums peuvent utiliser les identifiants de l'application; l'accès aux playlists dépend des droits utilisateur et du mode de l'application. |
@@ -155,6 +217,10 @@ Le bot continue à jouer lorsque le navigateur se ferme ou que le tunnel se reco
 Les appels Spotify et les résolutions de médias ont des délais limités. Certaines playlists Spotify peuvent être refusées par l'API même si leur page web est publique; consulte les [conditions d'accès de Spotify](https://developer.spotify.com/documentation/web-api/reference/get-playlists-items).
 
 `GET /health` expose l'état du routage audio, le nombre de clients et la longueur de la file pour faciliter le diagnostic. Le [rapport d'audit](docs/AUDIT.md) détaille les corrections, les tests et les limites restantes.
+
+`GET /metrics` renvoie les 100 dernières mesures d'opérations du backend, avec leur durée et leur résultat. Ces mesures restent en mémoire jusqu'au redémarrage; les journaux persistants sont disponibles séparément dans les diagnostics.
+
+Le cache de correspondances conserve les pages YouTube trouvées pour Spotify et les replis SoundCloud. Il se recharge au démarrage depuis `backend/.data/provider-match-cache.json`, ignoré par Git. Les URL audio temporaires ou signées restent exclues du fichier; chaque lecture peut obtenir un nouveau flux. Le cache ne sauvegarde ni la file ni l'historique.
 
 Le panneau **Diagnostic du bot** affiche l'état du serveur, de mpv et du routage, les erreurs récentes et le chemin exact des outils. Il se rafraîchit uniquement lorsqu'il est ouvert et que l'onglet est visible. Un export JSON permet de conserver un relevé pour un diagnostic.
 

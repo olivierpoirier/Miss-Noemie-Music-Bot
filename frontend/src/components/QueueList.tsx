@@ -17,12 +17,12 @@ import {
   sortableKeyboardCoordinates,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { Trash2, GripVertical, ListMusic, Shuffle } from "lucide-react";
+import { Trash2, GripVertical, ListMusic, Shuffle, SkipForward } from "lucide-react";
 
 import type { QueueItem } from "../types";
 import type { ThemeName } from "../lib/themes";
 import { cn } from "../lib/cn";
-import ThemedPanel from "./ui/ThemedPanel";
+import { Button, ThemedPanel } from "./ui";
 
 interface Props {
   queue: QueueItem[];
@@ -187,18 +187,16 @@ function SortableQueueItem({
           </div>
         </div>
 
-        <button
+        <Button
           disabled={disabled || isPending}
           onClick={() => onRemove(item.id)}
-          className={cn(
-            "p-2 shrink-0 rounded-lg transition themed-danger-button",
-            rainbow && "rainbow-cycle"
-          )}
+          variant="danger"
+          size="icon"
+          rainbow={rainbow}
           title="Retirer de la file"
-          type="button"
-        >
-          <Trash2 className="w-4 h-4" />
-        </button>
+          aria-label="Retirer de la file"
+          icon={Trash2}
+        />
       </div>
     </ThemedPanel>
   );
@@ -288,58 +286,49 @@ export default function QueueList({
           </h2>
 
           <div className="flex gap-2 flex-wrap justify-end">
-            <button
+            <Button
               onClick={onShuffle}
-              className={cn(
-                "text-xs px-3 py-2 rounded-lg themed-secondary-button inline-flex items-center gap-2",
-                rainbow && "rainbow-cycle"
-              )}
               title="Mélanger la file"
-              type="button"
+              icon={Shuffle}
+              size="sm"
+              rainbow={rainbow}
             >
-              <Shuffle className="w-3.5 h-3.5" />
               Shuffle
-            </button>
+            </Button>
 
-            <button
+            <Button
               onClick={onToggleRandom}
-              className={cn(
-                "text-xs px-3 py-2 rounded-lg border transition inline-flex items-center gap-2",
-                randomMode
-                  ? "border-[var(--c1)] text-[var(--c1)] bg-[color-mix(in_oklab,var(--c1)_10%,transparent)]"
-                  : "border-white/10 bg-white/5 text-white/70 hover:text-white",
-                rainbow && "rainbow-cycle"
-              )}
               title="Mode lecture aléatoire"
-              type="button"
+              icon={Shuffle}
+              variant="toggle"
+              active={randomMode}
+              size="sm"
+              rainbow={rainbow}
             >
-              <Shuffle className="w-3.5 h-3.5" />
               Aléatoire
-            </button>
+            </Button>
 
-            <button
+            <Button
               onClick={onSkipGroup}
-              className={cn(
-                "text-xs px-3 py-2 rounded-lg themed-secondary-button",
-                rainbow && "rainbow-cycle"
-              )}
-              title="Passer le groupe"
-              type="button"
+              title="Passer le groupe ou la playlist en cours; s'il n'y a pas de groupe, passe le morceau courant"
+              aria-label="Passer le groupe en cours"
+              icon={SkipForward}
+              size="sm"
+              rainbow={rainbow}
             >
-              Skip
-            </button>
+              Passer groupe
+            </Button>
 
-            <button
+            <Button
               onClick={onClear}
-              className={cn(
-                "text-xs px-3 py-2 rounded-lg themed-danger-button",
-                rainbow && "rainbow-cycle"
-              )}
               title="Vider la file"
-              type="button"
+              icon={Trash2}
+              variant="danger"
+              size="sm"
+              rainbow={rainbow}
             >
               Vider
-            </button>
+            </Button>
           </div>
         </div>
 

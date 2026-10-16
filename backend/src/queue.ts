@@ -102,6 +102,7 @@ export function createQueueService(
     if (!source) return null;
     const item = enqueue({
       url: source.url,
+      sourceUrl: source.sourceUrl,
       title: source.title || "Titre en attente...",
       thumb: source.thumb,
       durationSec: source.durationSec || 0,

@@ -44,8 +44,8 @@ export default function SupportedLinksHelp({
             <span>SoundCloud</span>
           </div>
           <div className="opacity-85 space-y-1">
-            <div>â€¢ titre SoundCloud</div>
-            <div>â€¢ set / playlist SoundCloud</div>
+            <div>• titre SoundCloud</div>
+            <div>• set / playlist SoundCloud</div>
           </div>
         </ThemedPanel>
 
@@ -71,11 +71,11 @@ export default function SupportedLinksHelp({
             <span>Twitch et liens directs</span>
           </div>
           <div className="opacity-85 space-y-1">
-            <div>â€¢ live, VOD et clips Twitch</div>
-            <div>â€¢ fichiers ou flux audio publics : MP3, AAC, M3U8, FLAC, etc.</div>
+            <div>• live, VOD et clips Twitch</div>
+            <div>• fichiers ou flux audio publics : MP3, AAC, M3U8, FLAC, etc.</div>
             <div className="opacity-70">
-              Les sites protÃ©gÃ©s par une connexion ou un DRM restent limitÃ©s par
-              leurs propres droits d&apos;accÃ¨s.
+              Les sites protégés par une connexion ou un DRM restent limités par
+              leurs propres droits d&apos;accès.
             </div>
           </div>
         </ThemedPanel>

@@ -2,16 +2,19 @@ process.env.PLAY_DL_SKIP_PROMPT = "true";
 
 import "dotenv/config";
 import express from "express";
+import cors from "cors";
 import http from "http";
 import { Server as IOServer } from "socket.io";
 import { fileURLToPath } from "node:url";
 import { playbackPosition } from "../../shared/playback.js";
 import type { DiagnosticSnapshot } from "../../shared/contracts.js";
 
-import { APP_CONFIG, MPV_CONFIG } from "./config.js";
+import { APP_CONFIG, MPV_CONFIG, SECURITY_CONFIG } from "./config.js";
 import { normalizeAudioProfileName } from "./audioProfiles.js";
 import { state, playing } from "./types.js";
 import { queueService } from "./queue.js";
+import { getMetrics } from "./metrics.js";
+import { flushProviderMatchCache } from "./providerCache.js";
 import { diagnostics, recordDiagnostic, diagnosticErrorDetails } from "./diagnostics.js";
 import { checkToolDiagnostics } from "./toolDiagnostics.js";
 import {
@@ -39,8 +42,7 @@ import {
 } from "./ytdlp.js";
 import {
   isPlaylistUrl,
-  isSoundCloudSetUrl,
-  isSoundCloudShortUrl,
+  isSoundCloudUrl,
   isSpotifyUrl,
   isYoutubeSearchUrl,
 } from "./platforms/index.js";
@@ -53,9 +55,28 @@ import {
 const app = express();
 const server = http.createServer(app);
 
+function isOriginAllowed(origin?: string): boolean {
+  if (!origin || SECURITY_CONFIG.allowedOrigins.length === 0) return true;
+  return SECURITY_CONFIG.allowedOrigins.some((pattern) => {
+    const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`^${escaped.replace(/\*/g, ".*")}$`, "i").test(origin);
+  });
+}
+
+const corsOptions = {
+  origin: (origin: string | undefined, callback: (error: Error | null, allow?: boolean) => void) => {
+    callback(null, isOriginAllowed(origin));
+  },
+};
+app.use(cors(corsOptions));
 const io = new IOServer(server, {
-  cors: { origin: "*" },
+  cors: corsOptions,
+  maxHttpBufferSize: SECURITY_CONFIG.maxSocketPayloadBytes,
   perMessageDeflate: false,
+});
+io.use((socket, next) => {
+  if (isOriginAllowed(socket.handshake.headers.origin)) next();
+  else next(new Error("Origine non autorisée."));
 });
 
 /* --- VARIABLES DE CONTRÔLE DU CYCLE DE VIE --- */
@@ -156,6 +177,7 @@ app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     uptime: process.uptime(),
+    memory: process.memoryUsage(),
     activeUsers,
     audioRouting: getRuntimeAudioRouting(),
     playing: Boolean(playing),
@@ -164,8 +186,12 @@ app.get("/health", (req, res) => {
   });
 });
 
+app.get("/metrics", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.json({ status: "ok", metrics: getMetrics() });
+});
+
 app.get("/diagnostics", (_req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
   // Return only explicit diagnostic fields. Configuration objects include
   // credentials and must never be serialized, even for a local server.
   void (async () => {
@@ -208,6 +234,29 @@ app.get("/diagnostics", (_req, res) => {
 /* --- LOGIQUE SOCKET --- */
 
 io.on("connection", (socket) => {
+  let windowStartedAt = Date.now();
+  let commandCount = 0;
+  let nextRateLimitToastAt = 0;
+  const acceptCommand = (event: string, payload: unknown): boolean => {
+    const now = Date.now();
+    if (now - windowStartedAt >= SECURITY_CONFIG.socketRateLimitWindowMs) {
+      windowStartedAt = now;
+      commandCount = 0;
+    }
+    if (++commandCount <= SECURITY_CONFIG.socketRateLimitMax) return true;
+    const message = "Trop de commandes. Réessaie dans quelques secondes.";
+    if (event === "play") {
+      const clientRequestId = payload && typeof payload === "object" &&
+        "clientRequestId" in payload && typeof payload.clientRequestId === "string"
+        ? payload.clientRequestId.trim().slice(0, 128) || undefined : undefined;
+      socket.emit("play_result", { clientRequestId, ok: false, message });
+    }
+    if (now >= nextRateLimitToastAt) {
+      socket.emit("toast", message);
+      nextRateLimitToastAt = now + 5_000;
+    }
+    return false;
+  };
   // EventEmitter does not await async callbacks. Contain rejected commands and
   // malformed payloads here rather than letting them terminate the process.
   const on = (
@@ -216,6 +265,7 @@ io.on("connection", (socket) => {
     serialized = false
   ) => {
     socket.on(event, (payload: unknown) => {
+      if (!acceptCommand(event, payload)) return;
       const run = async () => {
         try {
           await handler(payload);
@@ -282,11 +332,11 @@ io.on("connection", (socket) => {
       try {
         const raw = typeof payload?.url === "string" ? payload.url.trim() : "";
         const addedBy = typeof payload?.addedBy === "string"
-          ? payload.addedBy.slice(0, 32) || "anon"
+          ? payload.addedBy.trim().slice(0, 32) || "anon"
           : "anon";
 
-        if (!raw || raw.length > 4096) {
-          result(false, "Entre un lien ou une recherche valide (4096 caractères maximum).");
+        if (!raw || raw.length > SECURITY_CONFIG.queueInputMaxLength) {
+          result(false, `Entre un lien ou une recherche valide (${SECURITY_CONFIG.queueInputMaxLength} caractères maximum).`);
           return;
         }
 
@@ -330,8 +380,7 @@ io.on("connection", (socket) => {
 
         const spotify = isSpotifyUrl(normalized);
         const playlist = isPlaylistUrl(normalized);
-        const soundcloudExpandable =
-          isSoundCloudSetUrl(normalized) || isSoundCloudShortUrl(normalized);
+        const soundcloudExpandable = isSoundCloudUrl(normalized);
 
         if (spotify || playlist || soundcloudExpandable) {
           socket.emit(
@@ -502,7 +551,8 @@ io.on("connection", (socket) => {
   }, true);
 
   on("reorder_queue", (payload: { ids?: unknown } | null) => {
-    if (!Array.isArray(payload?.ids) || !payload.ids.every((id) => typeof id === "string")) {
+    if (!Array.isArray(payload?.ids) || payload.ids.length > SECURITY_CONFIG.reorderMaxItems ||
+      !payload.ids.every((id) => typeof id === "string")) {
       throw new Error("Ordre de file invalide");
     }
     queueService.reorder(payload.ids as string[]);
@@ -560,7 +610,7 @@ async function shutdown(signal: string): Promise<void> {
     console.warn("[server] player shutdown failed", error);
   }
 
-  await diagnostics.flush();
+  await Promise.allSettled([diagnostics.flush(), flushProviderMatchCache()]);
   io.close(() => process.exit(exitCode));
 }
 

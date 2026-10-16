@@ -55,9 +55,9 @@ export default function NowPlaying({
   const { isAdventurer, isPremium, isRetrowave } = ui;
 
   const cardCls = [
-    "relative overflow-hidden border border-transparent p-4 shadow-soft transition-all duration-500",
-    isAdventurer ? "organic-panel" : "rounded-xl bg-bg/80 backdrop-blur-xl",
-    rainbow ? "neon-glow rainbow-border rainbow-cycle" : "neon-glow themed-border",
+    "relative overflow-hidden border p-4 shadow-soft transition-all duration-500",
+    isAdventurer ? "organic-panel" : "rounded-[var(--ui-panel-radius)] bg-bg/80 backdrop-blur-xl",
+    rainbow ? "neon-glow rainbow-border rainbow-cycle" : "neon-glow themed-surface-border",
   ].join(" ");
 
   const playingGlow =

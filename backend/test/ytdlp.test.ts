@@ -108,7 +108,7 @@ test("missing cookies do not duplicate YouTube extraction attempts and custom cl
   const attempts = calls();
   assert.equal(attempts.length, 3);
   assert.equal(attempts[0][attempts[0].indexOf("--extractor-args") + 1], "youtube:player_client=configured-client");
-  assert.equal(attempts[2][attempts[2].indexOf("--extractor-args") + 1], "youtube:player_client=android");
+  assert.equal(attempts[1][attempts[1].indexOf("--extractor-args") + 1], "youtube:player_client=android");
 });
 
 test("a hung extractor is killed and source resolution releases within its total deadline", async () => {

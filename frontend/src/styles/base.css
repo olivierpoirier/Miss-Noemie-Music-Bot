@@ -9,6 +9,11 @@
   --muted: #94a3b8;
   --c1: #22d3ee;
   --c2: #f472b6;
+  --ui-border-width: 2px;
+  --ui-control-radius: 999px;
+  --ui-small-radius: 18px;
+  --ui-card-radius: 26px;
+  --ui-panel-radius: 30px;
 }
 
 html,
@@ -25,4 +30,13 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--ink);
+}
+
+button {
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+button:disabled {
+  cursor: not-allowed;
 }

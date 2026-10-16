@@ -175,3 +175,51 @@ test("optional idle shutdown is cancelled by reconnect and applies after last di
     await server.stop();
   }
 });
+
+
+test("origin allowlist covers diagnostics and direct WebSocket connections", { timeout: 15000, skip: process.platform !== "linux" }, async () => {
+  const server = await startServer("0", { BACKEND_ALLOWED_ORIGINS: "https://*.trusted.example" });
+  try {
+    const allowed = await fetch(`${server.url}/diagnostics`, { headers: { Origin: "https://music.trusted.example" } });
+    assert.equal(allowed.headers.get("access-control-allow-origin"), "https://music.trusted.example");
+    const blocked = await fetch(`${server.url}/diagnostics`, { headers: { Origin: "https://untrusted.example" } });
+    assert.equal(blocked.headers.get("access-control-allow-origin"), null);
+    const metrics = await fetch(`${server.url}/metrics`);
+    assert.equal(metrics.headers.get("cache-control"), "no-store");
+    assert.deepEqual((await metrics.json()).metrics, []);
+    const health = await (await fetch(`${server.url}/health`)).json();
+    assert.ok(health.memory.rss > 0);
+    // A raw upgrade verifies the origin guard for websocket-only clients.
+    const socket = net.createConnection(Number(new URL(server.url).port), "127.0.0.1");
+    await once(socket, "connect");
+    socket.write(`GET /socket.io/?EIO=4&transport=websocket HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nOrigin: https://untrusted.example\r\n\r\n`);
+    let response = "";
+    socket.on("data", (data) => {
+      response += data.toString();
+      if (response.includes("0{\"sid")) {
+        // Masked websocket text frame containing the Socket.IO connect packet.
+        socket.write(Buffer.from([0x81, 0x82, 0, 0, 0, 0, 0x34, 0x30]));
+      }
+    });
+    for (let i = 0; i < 100 && !response.includes("Origine non autorisée"); i++) await delay(10);
+    socket.destroy();
+    assert.ok(response.includes("Origine non autorisée"));
+  } finally { await server.stop(); }
+});
+
+test("rate-limited additions still acknowledge their request and the budget resets", { timeout: 15000, skip: process.platform !== "linux" }, async () => {
+  const server = await startServer("0", { SOCKET_RATE_LIMIT_MAX: "1", SOCKET_RATE_LIMIT_WINDOW_MS: "500" });
+  let socket: Awaited<ReturnType<typeof connect>> | undefined;
+  try {
+    socket = await connect(server.url);
+    socket.emit("command", { cmd: "random_mode", arg: true });
+    await socket.waitFor("state", (state) => state.control.randomMode);
+    socket.emit("play", { url: "valid search", clientRequestId: "rate-limited" });
+    const result = await socket.waitFor("play_result", (data) => data.clientRequestId === "rate-limited");
+    assert.equal(result.ok, false);
+    assert.match(result.message, /Trop de commandes/);
+    await delay(550);
+    socket.emit("command", { cmd: "random_mode", arg: false });
+    await socket.waitFor("state", (state) => !state.control.randomMode);
+  } finally { socket?.ws.close(); await server.stop(); }
+});

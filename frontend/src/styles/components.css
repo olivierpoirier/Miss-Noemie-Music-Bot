@@ -3,7 +3,7 @@
    ========================= */
 
 .organic-panel {
-  border-radius: 30px;
+  border-radius: var(--ui-panel-radius);
   background:
     linear-gradient(135deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.01)),
     var(--panel);
@@ -11,7 +11,7 @@
 }
 
 .organic-panel-soft {
-  border-radius: 26px;
+  border-radius: var(--ui-card-radius);
   background:
     linear-gradient(135deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.01)),
     rgba(26, 34, 27, 0.68);
@@ -31,9 +31,9 @@
 .themed-border::before {
   content: "";
   position: absolute;
-  inset: -2px;
+  inset: calc(var(--ui-border-width) * -1);
   border-radius: inherit;
-  padding: 2px;
+  padding: var(--ui-border-width);
   background: linear-gradient(135deg, var(--c1), var(--c2));
   -webkit-mask:
     linear-gradient(#000 0 0) content-box,
@@ -47,6 +47,34 @@
   opacity: 0.95;
 }
 
+.border {
+  border-width: var(--ui-border-width);
+}
+
+.border-t {
+  border-top-width: 1px;
+}
+
+.border-b {
+  border-bottom-width: 1px;
+}
+
+.rounded {
+  border-radius: var(--ui-small-radius);
+}
+
+.rounded-lg {
+  border-radius: var(--ui-small-radius);
+}
+
+.rounded-xl {
+  border-radius: var(--ui-card-radius);
+}
+
+.rounded-2xl {
+  border-radius: var(--ui-panel-radius);
+}
+
 .rainbow-border {
   position: relative;
 }
@@ -54,9 +82,9 @@
 .rainbow-border::before {
   content: "";
   position: absolute;
-  inset: -2px;
+  inset: calc(var(--ui-border-width) * -1);
   border-radius: inherit;
-  padding: 2px;
+  padding: var(--ui-border-width);
   background: conic-gradient(from 0deg, #22d3ee, #a78bfa, #f472b6, #22d3ee);
   -webkit-mask:
     linear-gradient(#000 0 0) content-box,
@@ -69,26 +97,126 @@
   pointer-events: none;
 }
 
+.themed-control-border {
+  border: var(--ui-border-width) solid transparent;
+  border-radius: var(--ui-control-radius);
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in oklab, var(--panel) 92%, black 12%),
+      color-mix(in oklab, var(--panel) 86%, black 18%)
+    ) padding-box,
+    linear-gradient(
+      110deg,
+      var(--c1),
+      color-mix(in oklab, var(--c1) 42%, var(--c2) 58%),
+      var(--c2)
+    ) border-box;
+  box-shadow:
+    inset 0 1px 18px rgba(0, 0, 0, 0.22),
+    0 0 0 1px color-mix(in oklab, var(--c1) 10%, transparent),
+    0 10px 24px rgba(0, 0, 0, 0.18);
+}
+
+.themed-control-border:focus-within {
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in oklab, var(--panel) 96%, black 8%),
+      color-mix(in oklab, var(--panel) 88%, black 14%)
+    ) padding-box,
+    linear-gradient(110deg, var(--c1), var(--c2)) border-box;
+  box-shadow:
+    inset 0 1px 18px rgba(0, 0, 0, 0.22),
+    0 0 0 4px color-mix(in oklab, var(--c1) 18%, transparent),
+    0 16px 34px color-mix(in oklab, var(--c2) 13%, transparent);
+}
+
+.rainbow-control-border {
+  border: var(--ui-border-width) solid transparent;
+  border-radius: var(--ui-control-radius);
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in oklab, var(--panel) 92%, black 12%),
+      color-mix(in oklab, var(--panel) 86%, black 18%)
+    ) padding-box,
+    conic-gradient(from 120deg, #22d3ee, #a78bfa, #f472b6, #86efac, #22d3ee) border-box;
+  box-shadow:
+    inset 0 1px 18px rgba(0, 0, 0, 0.22),
+    0 0 0 1px rgba(255, 255, 255, 0.08),
+    0 10px 24px rgba(0, 0, 0, 0.18);
+}
+
+.themed-surface-border {
+  border-color: color-mix(
+    in oklab,
+    color-mix(in oklab, var(--c1) 58%, var(--c2)) 72%,
+    transparent
+  );
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    0 0 0 1px color-mix(in oklab, var(--c2) 10%, transparent),
+    0 12px 28px rgba(0, 0, 0, 0.18);
+}
+
+.themed-soft-surface-border {
+  border-color: color-mix(
+    in oklab,
+    color-mix(in oklab, var(--c1) 62%, var(--c2)) 64%,
+    transparent
+  );
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 6px 18px rgba(0, 0, 0, 0.14);
+}
+
+*:not(button)[class*="border-white/"],
+*:not(button)[class*="border-slate-"],
+*:not(button)[class*="border-[#"] {
+  border-color: color-mix(
+    in oklab,
+    color-mix(in oklab, var(--c1) 58%, var(--c2)) 58%,
+    transparent
+  );
+}
+
 .theme-active-button {
-  background-color: var(--c1);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.18), transparent 44%),
+    linear-gradient(135deg, var(--c1), color-mix(in oklab, var(--c2) 46%, var(--c1)));
   color: var(--ink);
+  border: var(--ui-border-width) solid color-mix(in oklab, var(--c1) 78%, white 12%);
+  border-radius: var(--ui-control-radius);
   font-weight: 700;
   transition:
-    transform 0.15s ease-out,
-    box-shadow 0.15s ease-out,
-    filter 0.15s ease;
-  box-shadow: 0 4px 12px color-mix(in oklab, var(--c1) 30%, transparent);
+    transform 0.16s ease-out,
+    box-shadow 0.16s ease-out,
+    border-color 0.16s ease-out,
+    background 0.16s ease-out,
+    filter 0.16s ease;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.35),
+    0 10px 22px color-mix(in oklab, var(--c1) 24%, transparent),
+    0 0 0 1px rgba(255, 255, 255, 0.08);
 }
 
 .theme-active-button:hover:not(:disabled) {
-  filter: saturate(1.15) brightness(1.05);
-  transform: translateY(-1px);
+  border-color: color-mix(in oklab, var(--c2) 58%, white 24%);
+  filter: saturate(1.18) brightness(1.08);
+  transform: translateY(-2px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.42),
+    0 16px 30px color-mix(in oklab, var(--c1) 32%, transparent),
+    0 0 0 4px color-mix(in oklab, var(--c1) 16%, transparent);
 }
 
 .theme-active-button:active:not(:disabled) {
   filter: saturate(0.95) brightness(0.9);
-  transform: translateY(1px);
-  box-shadow: 0 2px 8px color-mix(in oklab, var(--c1) 40%, transparent);
+  transform: translateY(0);
+  box-shadow:
+    inset 0 2px 8px rgba(0, 0, 0, 0.28),
+    0 5px 12px color-mix(in oklab, var(--c1) 24%, transparent);
 }
 
 .theme-rainbow .theme-active-button {
@@ -102,26 +230,130 @@
 }
 
 .themed-danger-button {
-  background: color-mix(in oklab, var(--c2) 16%, transparent);
-  color: color-mix(in oklab, var(--c2) 55%, white 10%);
-  border: 1px solid color-mix(in oklab, var(--c2) 30%, transparent);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.06), transparent 50%),
+    color-mix(in oklab, var(--c2) 14%, transparent);
+  color: color-mix(in oklab, var(--c2) 50%, white 18%);
+  border: var(--ui-border-width) solid color-mix(in oklab, var(--c2) 38%, transparent);
+  border-radius: var(--ui-control-radius);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 6px 16px rgba(0, 0, 0, 0.18);
   transition: 160ms ease;
 }
 
 .themed-danger-button:hover {
-  background: color-mix(in oklab, var(--c2) 22%, transparent);
-  border-color: color-mix(in oklab, var(--c2) 45%, transparent);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.1), transparent 50%),
+    color-mix(in oklab, var(--c2) 24%, transparent);
+  border-color: color-mix(in oklab, var(--c2) 64%, transparent);
+  color: color-mix(in oklab, var(--c2) 42%, white 32%);
+  transform: translateY(-1px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    0 10px 22px color-mix(in oklab, var(--c2) 18%, transparent);
 }
 
 .themed-secondary-button {
-  background: color-mix(in oklab, var(--c1) 10%, transparent);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.07), transparent 50%),
+    color-mix(in oklab, var(--c1) 10%, transparent);
   color: var(--ink);
-  border: 1px solid color-mix(in oklab, var(--c1) 22%, transparent);
+  border: var(--ui-border-width) solid color-mix(in oklab, var(--c1) 32%, transparent);
+  border-radius: var(--ui-control-radius);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.09),
+    0 6px 16px rgba(0, 0, 0, 0.18);
   transition: 160ms ease;
 }
 
 .themed-secondary-button:hover {
-  background: color-mix(in oklab, var(--c1) 16%, transparent);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.12), transparent 50%),
+    color-mix(in oklab, var(--c1) 18%, transparent);
+  border-color: color-mix(in oklab, var(--c1) 58%, transparent);
+  transform: translateY(-1px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    0 10px 22px color-mix(in oklab, var(--c1) 18%, transparent);
+}
+
+.themed-ghost-button {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.06), transparent 50%),
+    rgba(255, 255, 255, 0.05);
+  color: rgba(255, 255, 255, 0.74);
+  border: var(--ui-border-width) solid rgba(255, 255, 255, 0.13);
+  border-radius: var(--ui-control-radius);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  transition: 160ms ease;
+}
+
+.themed-ghost-button:hover {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.1), transparent 50%),
+    rgba(255, 255, 255, 0.09);
+  color: white;
+  border-color: rgba(255, 255, 255, 0.24);
+  transform: translateY(-1px);
+}
+
+.themed-toggle-button {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.06), transparent 50%),
+    rgba(255, 255, 255, 0.05);
+  color: rgba(255, 255, 255, 0.72);
+  border: var(--ui-border-width) solid rgba(255, 255, 255, 0.14);
+  border-radius: var(--ui-control-radius);
+  transition: 160ms ease;
+}
+
+.themed-toggle-button:hover {
+  background: color-mix(in oklab, var(--c1) 12%, rgba(255, 255, 255, 0.08));
+  color: white;
+  border-color: color-mix(in oklab, var(--c1) 38%, transparent);
+  transform: translateY(-1px);
+}
+
+.themed-toggle-button-active {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.12), transparent 48%),
+    color-mix(in oklab, var(--c1) 18%, transparent);
+  color: color-mix(in oklab, var(--c1) 70%, white 18%);
+  border-color: color-mix(in oklab, var(--c1) 72%, transparent);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    0 0 0 4px color-mix(in oklab, var(--c1) 10%, transparent);
+}
+
+button[class*="border"]:not(.theme-active-button):not(.themed-secondary-button):not(.themed-danger-button):not(.themed-ghost-button):not(.themed-toggle-button) {
+  border-width: var(--ui-border-width);
+  border-radius: var(--ui-control-radius);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 6px 14px rgba(0, 0, 0, 0.16);
+  transition:
+    transform 0.16s ease-out,
+    box-shadow 0.16s ease-out,
+    border-color 0.16s ease-out,
+    background-color 0.16s ease-out,
+    color 0.16s ease-out,
+    filter 0.16s ease-out;
+}
+
+button[class*="border"]:not(.theme-active-button):not(.themed-secondary-button):not(.themed-danger-button):not(.themed-ghost-button):not(.themed-toggle-button):hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.13),
+    0 10px 20px rgba(0, 0, 0, 0.22),
+    0 0 0 4px color-mix(in oklab, var(--c1) 10%, transparent);
+}
+
+button[class*="border"]:not(.theme-active-button):not(.themed-secondary-button):not(.themed-danger-button):not(.themed-ghost-button):not(.themed-toggle-button):active:not(:disabled) {
+  transform: translateY(0);
+  box-shadow:
+    inset 0 2px 7px rgba(0, 0, 0, 0.28),
+    0 4px 10px rgba(0, 0, 0, 0.18);
 }
 
 /* =========================
@@ -228,14 +460,14 @@
   height: 100%;
   display: grid;
   grid-template-columns: repeat(var(--bars-count), minmax(3px, 1fr));
-  align-items: end;
+  align-items: flex-end;
   gap: clamp(2px, 0.35vw, 5px);
 }
 
 .spectrum-bar-shell {
   height: 100%;
   display: flex;
-  align-items: end;
+  align-items: flex-end;
   min-width: 0;
 }
 
@@ -289,7 +521,7 @@
 .theme-premium .themed-danger-button {
   background: rgba(255, 255, 255, 0.04) !important;
   color: #f3f4f6 !important;
-  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  border: var(--ui-border-width) solid rgba(255, 255, 255, 0.14) !important;
 }
 
 .theme-premium .themed-secondary-button:hover,

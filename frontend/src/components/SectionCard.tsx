@@ -39,7 +39,7 @@ export default function SectionCard({
             <div className="flex items-center gap-3 min-w-0">
               <div
                 className={cn(
-                  "w-10 h-10 rounded-2xl border border-white/10 bg-white/5 flex items-center justify-center shrink-0",
+                  "w-10 h-10 rounded-full border border-white/10 bg-white/5 flex items-center justify-center shrink-0",
                   rainbow && "rainbow-cycle"
                 )}
               >
@@ -55,7 +55,7 @@ export default function SectionCard({
             <button
               onClick={onCollapse}
               className={cn(
-                "p-2.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 transition shrink-0 text-white/70 hover:text-white",
+                "themed-ghost-button p-2.5 shrink-0 text-white/70 hover:text-white",
                 rainbow && "rainbow-cycle"
               )}
               title="Réduire la section"
@@ -95,7 +95,7 @@ export function SectionTab({
       transition={{ duration: 0.18, ease: "easeOut" }}
       onClick={onOpen}
       className={cn(
-        "inline-flex items-center gap-2.5 px-3.5 py-2.5 rounded-2xl bg-white/5 backdrop-blur-md border border-white/10 hover:bg-white/10 transition text-white/80",
+        "themed-ghost-button inline-flex items-center gap-2.5 px-3.5 py-2.5 backdrop-blur-md text-white/80",
         rainbow && "rainbow-cycle"
       )}
       title={`Ouvrir ${title}`}

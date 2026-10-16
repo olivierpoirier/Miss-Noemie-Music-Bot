@@ -41,6 +41,8 @@ export type Now = {
 export type QueueItem = {
   id: string;
   url: string;
+  /** Original provider page or Spotify query, retained when playback uses a match. */
+  sourceUrl?: string;
   title?: string;
   thumb: string | null;
   group?: string;

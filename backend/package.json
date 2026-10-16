@@ -11,18 +11,18 @@
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
+    "cors": "^2.8.6",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.2",
     "play-dl": "^1.9.7",
-    "socket.io": "^4.7.5",
+    "socket.io": "^4.8.3",
     "voicemeeter-connector": "^2.2.0",
     "yt-dlp-exec": "^1.0.2"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
-    "@types/express": "^4.17.21",
-    "tsx": "^4.17.0",
-    "typescript": "^5.5.4"
+    "@types/express": "^4.17.25",
+    "tsx": "^4.23.12",
+    "typescript": "^5.9.3"
   }
 }
