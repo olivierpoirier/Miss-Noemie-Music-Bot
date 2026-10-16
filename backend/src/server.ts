@@ -16,6 +16,7 @@ import { queueService } from "./queue.js";
 import { getMetrics } from "./metrics.js";
 import { flushProviderMatchCache } from "./providerCache.js";
 import { diagnostics, recordDiagnostic, diagnosticErrorDetails } from "./diagnostics.js";
+import { installRuntimeDiagnostics } from "./runtimeDiagnostics.js";
 import { checkToolDiagnostics } from "./toolDiagnostics.js";
 import {
   ensurePlayerLoop,
@@ -252,6 +253,7 @@ io.on("connection", (socket) => {
       socket.emit("play_result", { clientRequestId, ok: false, message });
     }
     if (now >= nextRateLimitToastAt) {
+      recordDiagnostic("SOCKET_RATE_LIMITED", { reason: "rate_limit" });
       socket.emit("toast", message);
       nextRateLimitToastAt = now + 5_000;
     }
@@ -267,6 +269,7 @@ io.on("connection", (socket) => {
     socket.on(event, (payload: unknown) => {
       if (!acceptCommand(event, payload)) return;
       const run = async () => {
+        if (isShuttingDown) return;
         try {
           await handler(payload);
         } catch (error) {
@@ -285,6 +288,7 @@ io.on("connection", (socket) => {
   };
 
   activeUsers++;
+  recordDiagnostic("SOCKET_CONNECTED", { activeUsers });
   console.log(`👤 Client connecté. Total: ${activeUsers}`);
 
   if (shutdownTimer) {
@@ -312,6 +316,8 @@ io.on("connection", (socket) => {
   on(
     "play",
     async (payload: { url?: string; addedBy?: string; clientRequestId?: string }) => {
+      const startedAt = Date.now();
+      recordDiagnostic("QUEUE_ADD_STARTED");
       // Respect controls received before this add (especially a queued clear),
       // while leaving unrelated media imports free to resolve concurrently.
       await controlTask;
@@ -319,17 +325,27 @@ io.on("connection", (socket) => {
       const clientRequestId = typeof payload?.clientRequestId === "string"
         ? payload.clientRequestId.trim().slice(0, 128) || undefined
         : undefined;
-      const result = (ok: boolean, message?: string) => {
+      let responded = false;
+      const result = (ok: boolean, message?: string, details: { itemCount?: number; cancelled?: boolean; error?: unknown } = {}) => {
+        if (responded) return;
+        responded = true;
+        recordDiagnostic(details.cancelled ? "QUEUE_ADD_CANCELLED" : ok ? "QUEUE_ADD_SUCCEEDED" : "QUEUE_ADD_FAILED", {
+          durationMs: Date.now() - startedAt,
+          itemCount: details.itemCount,
+          ...(!ok && details.error ? diagnosticErrorDetails(details.error) : {}),
+          ...(details.cancelled ? { reason: "cancelled" } : {}),
+        });
         const detail = message?.slice(0, 500);
         socket.emit("play_result", { clientRequestId, ok, message: detail });
         if (!ok && detail) socket.emit("toast", detail);
       };
       const cancelled = () => {
         if (revision === queueRevision && !isShuttingDown) return false;
-        result(false, "Ajout annulé : la file a été vidée.");
+        result(false, "Ajout annulé : la file a été vidée.", { cancelled: true });
         return true;
       };
       try {
+        if (cancelled()) return;
         const raw = typeof payload?.url === "string" ? payload.url.trim() : "";
         const addedBy = typeof payload?.addedBy === "string"
           ? payload.addedBy.trim().slice(0, 32) || "anon"
@@ -367,7 +383,7 @@ io.on("connection", (socket) => {
             clientRequestId,
           });
 
-          finishQueueAdd(() => result(true));
+          finishQueueAdd(() => result(true, undefined, { itemCount: 1 }));
           return;
         }
 
@@ -406,7 +422,7 @@ io.on("connection", (socket) => {
               ? `${items.length} titres ajoutés !`
               : "Titre ajouté !"
           );
-          finishQueueAdd(() => result(true));
+          finishQueueAdd(() => result(true, undefined, { itemCount: items.length }));
           return;
         }
 
@@ -418,12 +434,12 @@ io.on("connection", (socket) => {
           clientRequestId,
         });
 
-        finishQueueAdd(() => result(true), () => {
+        finishQueueAdd(() => result(true, undefined, { itemCount: 1 }), () => {
           void enrichQueuedItem(queued.id, normalized);
         });
       } catch (e) {
         console.error("[Play Error]", e);
-        result(false, e instanceof Error ? e.message : "Erreur d'ajout.");
+        result(false, e instanceof Error ? e.message : "Erreur d'ajout.", { error: e });
       }
     }
   );
@@ -575,8 +591,18 @@ io.on("connection", (socket) => {
     true
   );
 
-  socket.on("disconnect", () => {
+  socket.on("disconnect", (reason: string) => {
     activeUsers = Math.max(0, activeUsers - 1);
+    const reasons: Record<string, string> = {
+      "client namespace disconnect": "client_disconnect",
+      "server namespace disconnect": "server_disconnect",
+      "server shutting down": "shutdown",
+      "transport close": "transport_close",
+      "transport error": "transport_error",
+      "ping timeout": "ping_timeout",
+      "parse error": "parse_error",
+    };
+    recordDiagnostic("SOCKET_DISCONNECTED", { activeUsers, reason: reasons[reason] || "unknown" });
     console.log(`👤 Client déconnecté. Restants: ${activeUsers}`);
 
     if (activeUsers === 0 && APP_CONFIG.idleShutdownMs > 0) {
@@ -592,17 +618,24 @@ io.on("connection", (socket) => {
 });
 
 let isShuttingDown = false;
+let stopRuntimeDiagnostics = () => {};
 
 async function shutdown(signal: string): Promise<void> {
   if (isShuttingDown) return;
   isShuttingDown = true;
+  stopRuntimeDiagnostics();
   queueRevision++;
   if (shutdownTimer) clearTimeout(shutdownTimer);
-  const exitCode = Number(process.exitCode) || 0;
-  setTimeout(() => process.exit(exitCode), 3_000).unref();
+  const exitCode = () => Number(process.exitCode) || 0;
+  setTimeout(() => process.exit(exitCode()), 3_000).unref();
 
   console.log(`[server] ${signal} received, stopping player`);
-  recordDiagnostic("SERVER_STOPPING");
+  const stopReasons: Record<string, string> = {
+    SIGINT: "SIGINT", SIGTERM: "SIGTERM", "inactivité": "idle",
+    "erreur HTTP": "http_error", "erreur de démarrage": "startup_failed",
+    uncaught_exception: "uncaught_exception", unhandled_rejection: "unhandled_rejection",
+  };
+  recordDiagnostic("SERVER_STOPPING", { reason: stopReasons[signal] || "unknown" });
 
   try {
     await stopPlayer(broadcast);
@@ -611,19 +644,28 @@ async function shutdown(signal: string): Promise<void> {
   }
 
   await Promise.allSettled([diagnostics.flush(), flushProviderMatchCache()]);
-  io.close(() => process.exit(exitCode));
+  io.close(() => process.exit(exitCode()));
 }
 
 process.once("SIGINT", () => void shutdown("SIGINT"));
 process.once("SIGTERM", () => void shutdown("SIGTERM"));
 
+stopRuntimeDiagnostics = installRuntimeDiagnostics({
+  onFatal: (reason) => {
+    process.exitCode = 1;
+    return shutdown(reason);
+  },
+});
+
 /* --- BOOTSTRAP --- */
 
 async function bootstrap() {
   await diagnostics.initialize();
+  if (isShuttingDown) return;
   state.control.audioProfile = MPV_CONFIG.defaultAudioProfile;
 
   const audioReady = await refreshAudioRouting();
+  if (isShuttingDown) return;
   const audioRouting = getRuntimeAudioRouting();
 
   if (audioRouting.message) {

@@ -8,7 +8,8 @@
     "test": "node --import tsx --test test/*.test.ts",
     "doctor": "node --import tsx src/doctor.ts",
     "update:ytdlp": "node --import tsx src/doctor.ts --update-ytdlp",
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "logs": "node --import tsx src/logs.ts"
   },
   "dependencies": {
     "cors": "^2.8.6",

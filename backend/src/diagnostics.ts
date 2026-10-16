@@ -1,5 +1,6 @@
 import { appendFile, mkdir, open, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { DIAGNOSTICS_CONFIG } from "./config.js";
 import type { DiagnosticDetails, DiagnosticEvent as SharedDiagnosticEvent } from "../../shared/contracts.js";
 export type { DiagnosticDetails } from "../../shared/contracts.js";
@@ -8,6 +9,22 @@ type Level = SharedDiagnosticEvent["level"];
 // Messages are a closed catalog: raw errors, titles, cookies and signed stream
 // URLs can never accidentally be persisted or returned by the diagnostics API.
 const EVENTS = {
+  PROCESS_UNCAUGHT_EXCEPTION: ["error", "runtime", "Une erreur non interceptée impose l'arrêt du serveur."],
+  PROCESS_UNHANDLED_REJECTION: ["error", "runtime", "Une opération asynchrone non gérée impose l'arrêt du serveur."],
+  PROCESS_WARNING: ["warn", "runtime", "Node.js a signalé un avertissement de fonctionnement."],
+  RUNTIME_HEARTBEAT: ["info", "runtime", "Le serveur est actif. Relevé périodique de mémoire et de réactivité."],
+  SOCKET_CONNECTED: ["info", "server", "Une interface s'est connectée au serveur."],
+  SOCKET_DISCONNECTED: ["info", "server", "Une interface s'est déconnectée du serveur."],
+  SOCKET_RATE_LIMITED: ["warn", "server", "Des commandes ont été refusées temporairement car elles arrivaient trop vite."],
+  QUEUE_ADD_STARTED: ["info", "queue", "L'analyse d'un ajout à la file a commencé."],
+  QUEUE_ADD_SUCCEEDED: ["info", "queue", "L'ajout à la file a réussi."],
+  QUEUE_ADD_FAILED: ["warn", "queue", "L'ajout à la file a échoué."],
+  QUEUE_ADD_CANCELLED: ["info", "queue", "L'ajout en cours a été annulé."],
+  MEDIA_RESOLUTION_FALLBACK: ["warn", "providers", "Une méthode de résolution a échoué. Une autre méthode sera essayée."],
+  MEDIA_RESOLUTION_FAILED: ["error", "providers", "Aucune méthode n'a permis de résoudre cette source."],
+  PROVIDER_CACHE_FAILED: ["warn", "cache", "Le cache de correspondances des fournisseurs est indisponible. La lecture peut continuer sans ce cache."],
+  MPV_STREAM_FAILED: ["warn", "mpv", "Le flux audio a été refusé ou interrompu par mpv."],
+  PLAYBACK_START_FAILED: ["warn", "player", "La tentative de démarrage de la piste a échoué."],
   SERVER_STARTED: ["info", "server", "Serveur démarré."],
   SERVER_STOPPING: ["info", "server", "Arrêt du serveur demandé."],
   SERVER_START_FAILED: ["error", "server", "Le serveur n'a pas pu démarrer."],
@@ -18,6 +35,7 @@ const EVENTS = {
   MPV_STARTED: ["info", "mpv", "Le moteur mpv est prêt."],
   MPV_EXITED: ["warn", "mpv", "Le moteur mpv s'est arrêté de façon inattendue."],
   MPV_TRANSPORT_FAILED: ["error", "mpv", "La communication avec mpv a échoué."],
+  PLAYBACK_RECOVERED: ["info", "player", "La lecture a progressé normalement après la reprise. Le budget de récupération est rétabli."],
   PLAYBACK_STARTED: ["info", "player", "La lecture d'une piste a démarré."],
   PLAYBACK_STALLED: ["warn", "player", "La lecture ne progresse plus depuis 60 secondes."],
   PLAYBACK_RETRY: ["warn", "player", "Nouvelle tentative de lecture avec une source fraîche."],
@@ -40,18 +58,22 @@ export type DiagnosticEvent = Omit<SharedDiagnosticEvent, "code"> & { code: Diag
 
 const REASONS = new Set([
   "timeout", "network", "unauthorized", "forbidden", "rate_limit", "unavailable",
+  "client_disconnect", "server_disconnect", "transport_close", "transport_error", "ping_timeout", "parse_error", "cancelled", "shutdown",
+  "listener_limit", "deprecated", "uncaught_exception", "unhandled_rejection", "SIGINT", "SIGTERM", "idle", "startup_failed", "http_error",
   "ENOENT", "EACCES", "EPERM", "ECONNRESET", "ECONNREFUSED", "EPIPE", "ENOTFOUND", "EADDRINUSE", "unknown",
 ]);
 
 function safeDetails(input: DiagnosticDetails = {}): DiagnosticDetails | undefined {
   const result: DiagnosticDetails = {};
-  for (const key of ["status", "exitCode", "durationMs", "attempt"] as const) {
+  for (const key of ["status", "exitCode", "durationMs", "attempt", "activeUsers", "itemCount", "uptimeSec", "rssMB", "heapUsedMB", "lagMs"] as const) {
     const value = input[key];
     if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
       if (key === "status" && (value < 100 || value > 599)) continue;
       result[key] = Math.min(Math.round(value), 2_147_483_647);
     }
   }
+  if (typeof input.platform === "string" && ["youtube", "spotify", "soundcloud", "twitch", "direct", "generic", "unknown"].includes(input.platform)) result.platform = input.platform;
+  if (typeof input.stage === "string" && ["search", "metadata", "playlist", "shortlink", "extraction", "cache_load", "cache_write"].includes(input.stage)) result.stage = input.stage;
   if (typeof input.trackId === "string" && /^\d{1,12}$/.test(input.trackId)) result.trackId = input.trackId;
   if (typeof input.reason === "string" && REASONS.has(input.reason)) result.reason = input.reason;
   return Object.keys(result).length ? result : undefined;
@@ -72,6 +94,7 @@ type StoreOptions = { enabled: boolean; directory: string; maxBytes: number; max
 
 export function createDiagnosticStore(options: StoreOptions) {
   const filename = path.join(options.directory, "events.ndjson");
+  const runId = randomUUID();
   const maxBytes = Math.max(1024, options.maxBytes);
   const maxFiles = Math.max(1, Math.min(10, options.maxFiles));
   const maxEvents = Math.max(1, Math.min(1000, options.maxEvents));
@@ -106,7 +129,7 @@ export function createDiagnosticStore(options: StoreOptions) {
                     typeof data.timestamp !== "string" || !Number.isFinite(Date.parse(data.timestamp))) continue;
                 const code = data.code as DiagnosticCode;
                 const [level, category, message] = EVENTS[code];
-                loaded.push({ timestamp: new Date(data.timestamp).toISOString(), level, category, code, message, details: safeDetails(data.details) });
+                loaded.push({ ...(typeof data.runId === "string" && /^[a-f0-9-]{36}$/.test(data.runId) ? { runId: data.runId } : {}), timestamp: new Date(data.timestamp).toISOString(), level, category, code, message, details: safeDetails(data.details) });
               } catch { /* Ignore a truncated or corrupted line after a crash. */ }
             }
           } catch (error) {
@@ -122,11 +145,13 @@ export function createDiagnosticStore(options: StoreOptions) {
 
   const record = (code: DiagnosticCode, details?: DiagnosticDetails) => {
     const [level, category, message] = EVENTS[code];
-    const event: DiagnosticEvent = { timestamp: new Date().toISOString(), level, category, code, message, details: safeDetails(details) };
+    const event: DiagnosticEvent = { runId, timestamp: new Date().toISOString(), level, category, code, message, details: safeDetails(details) };
     recent.push(event);
     recent = recent.slice(-maxEvents);
     if (!options.enabled) return;
-    if (pendingWrites >= 200) { droppedWrites++; return; }
+    // Reserve space for fatal causes even after a burst of ordinary events.
+    const maxPending = code === "PROCESS_UNCAUGHT_EXCEPTION" || code === "PROCESS_UNHANDLED_REJECTION" ? 202 : 200;
+    if (pendingWrites >= maxPending) { droppedWrites++; return; }
     pendingWrites++;
     writes = writes.then(async () => {
       await initialize();
@@ -158,7 +183,7 @@ export function createDiagnosticStore(options: StoreOptions) {
     initialize,
     record,
     events: () => recent.slice().reverse().map((event) => ({ ...event, details: event.details && { ...event.details } })),
-    status: () => ({ enabled: options.enabled, available, droppedWrites }),
+    status: () => ({ enabled: options.enabled, available, droppedWrites, runId }),
     flush: () => writes,
   };
 }

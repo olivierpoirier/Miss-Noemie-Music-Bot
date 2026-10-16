@@ -55,6 +55,7 @@ export const DIAGNOSTICS_CONFIG = {
     fileURLToPath(new URL("../../.data/logs/", import.meta.url))
   ),
   maxBytes: Math.max(16_384, Math.min(envNumber("DIAGNOSTICS_MAX_BYTES", 1_048_576), 10_485_760)),
+  heartbeatMs: Math.max(30_000, Math.min(envNumber("DIAGNOSTICS_HEARTBEAT_MS", 300_000), 3_600_000)),
   maxFiles: 3,
   maxEvents: 100,
 };

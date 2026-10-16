@@ -18,6 +18,7 @@
     "update:ytdlp": "npm --prefix backend run update:ytdlp",
     "build:backend": "npm --prefix backend run build",
     "build:frontend": "npm --prefix frontend run build",
-    "build:frontend:vercel": "npm --prefix frontend run build:vercel"
+    "build:frontend:vercel": "npm --prefix frontend run build:vercel",
+    "logs": "npm --prefix backend run logs --"
   }
 }

@@ -53,12 +53,17 @@ const server = net.createServer((socket) => {
           send({ event: "end-file", reason: "error", error: "HTTP 403" });
         } else {
           send({ event: "file-loaded" });
-          send({ event: "property-change", name: "time-pos", data: 0 });
-          send({ event: "playback-restart" });
-          if (url.includes("early-eof")) send({ event: "end-file", reason: "eof" });
+          if (url.includes("stop-once") && attempts === 1) {
+            send({ event: "end-file", reason: "stop" });
+          } else {
+            send({ event: "property-change", name: "time-pos", data: 0 });
+            send({ event: "playback-restart" });
+            if (url.includes("early-eof")) send({ event: "end-file", reason: "eof" });
+          }
         }
       }
       if (command === "stop") send({ event: "end-file", reason: "stop" });
+      if (command === "fake-end-error") send({ event: "end-file", reason: "error", error: "HTTP 403" });
       if (command === "set_property" && url === "time-pos") {
         if (message.command[2] === 999) {
           send({ request_id: message.request_id, error: "property unavailable" });
@@ -159,6 +164,16 @@ if (url.includes("slow-skip")) {
     assert.equal(entries().filter((entry) => entry.event === "spawn").length, 2);
   });
 
+  await t.test("an immediate MPV stop after file-loaded retries without waiting for the watchdog", async () => {
+    await reset();
+    const current = item("stop-once");
+    state.queue = [current];
+    await player.ensurePlayerLoop(notify);
+    assert.equal(shared.playing?.item.id, current.id);
+    assert.equal(loads(current.url).length, 2);
+    assert.equal(state.now?.isBuffering, false);
+  });
+
   await t.test("a process crash after startup resumes the queue without a user command", async () => {
     await reset();
     const current = item("mid-track");
@@ -189,6 +204,67 @@ if (url.includes("slow-skip")) {
       await player.ensurePlayerLoop(notify);
       assert.notEqual(shared.playing!.handle.proc.pid, oldPid);
       assert.equal(loads(current.url).length, 2);
+    } finally {
+      context.mock.timers.reset();
+    }
+  });
+
+  await t.test("confirmed recovery re-arms long streams while rapid relapses stay bounded", async (context) => {
+    await reset();
+    const current = item("fail-once-long-stream");
+    state.queue = [current];
+    context.mock.timers.enable({ apis: ["Date", "setInterval"], now: Date.now() });
+    try {
+      await player.ensurePlayerLoop(notify);
+      assert.equal(loads(current.url).length, 2);
+      assert.equal(player.getPlayerDiagnostics().retryCount, 1);
+      state.control.paused = true;
+      context.mock.timers.tick(90_000);
+      assert.equal(player.getPlayerDiagnostics().retryCount, 1, "a pause is not healthy playback");
+      state.control.paused = false;
+      await player.seekAbsolute(100, notify);
+      assert.equal(player.getPlayerDiagnostics().retryCount, 1, "a seek is not healthy playback");
+      const handle = shared.playing!.handle;
+      for (let second = 1; second <= 29; second++) {
+        context.mock.timers.tick(1_000);
+        await handle.command("set_property", ["time-pos", 100 + second]);
+      }
+      assert.equal(player.getPlayerDiagnostics().retryCount, 1);
+      context.mock.timers.tick(1_000);
+      await handle.command("set_property", ["time-pos", 130]);
+      assert.equal(player.getPlayerDiagnostics().retryCount, 0);
+      await handle.command("fake-end-error");
+      await player.ensurePlayerLoop(notify);
+      assert.equal(current.status, "playing");
+      assert.equal(loads(current.url).length, 3, "a later isolated failure gets a fresh retry");
+      await shared.playing!.handle.command("fake-end-error");
+      await player.ensurePlayerLoop(notify);
+      assert.equal(current.status, "error", "two consecutive errors still abandon the broken source");
+      assert.equal(shared.playing, null);
+      assert.equal(loads(current.url).length, 3);
+    } finally {
+      context.mock.timers.reset();
+    }
+  });
+
+  await t.test("short MPV loops accumulate real recovery progress across repeat boundaries", async (context) => {
+    await reset();
+    const current = item("fail-once-short-repeat");
+    state.queue = [current];
+    state.control.repeat = true;
+    context.mock.timers.enable({ apis: ["Date", "setInterval"], now: Date.now() });
+    try {
+      await player.ensurePlayerLoop(notify);
+      assert.equal(player.getPlayerDiagnostics().retryCount, 1);
+      const handle = shared.playing!.handle;
+      for (let second = 1; second <= 35; second++) {
+        context.mock.timers.tick(1_000);
+        // loop-file rewinds internally without going through seekAbsolute().
+        await handle.command("set_property", ["time-pos", second % 10]);
+        if (second === 15) assert.equal(player.getPlayerDiagnostics().retryCount, 1);
+      }
+      assert.equal(player.getPlayerDiagnostics().retryCount, 0);
+      assert.equal(current.status, "playing");
     } finally {
       context.mock.timers.reset();
     }

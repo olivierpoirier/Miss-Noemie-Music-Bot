@@ -154,6 +154,61 @@ test("a long Spotify rate limit fails promptly without early retries", async () 
   assert.equal(apiRequests, 1);
 });
 
+test("Spotify's quota deadline also applies to later imports and releases when it expires", async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  let apiRequests = 0;
+  globalThis.fetch = async (input) => {
+    if (String(input).includes("/api/token")) return token();
+    return ++apiRequests === 1 ? json({}, 429, { "retry-after": "60" }) : json(track());
+  };
+  const { resolveSpotifyUrl } = await freshResolver();
+  await assert.rejects(resolveSpotifyUrl("spotify:track:offline"), { code: "SPOTIFY_RATE_LIMITED", status: 429 });
+  await assert.rejects(resolveSpotifyUrl("spotify:track:another"), { code: "SPOTIFY_RATE_LIMITED", status: 429 });
+  assert.equal(apiRequests, 1, "later queue additions must not extend the provider's quota rejection");
+  now += 60_001;
+  assert.equal((await resolveSpotifyUrl("spotify:track:offline")).length, 1);
+  assert.equal(apiRequests, 2);
+});
+
+test("Spotify honors HTTP-date Retry-After values without retrying early", async () => {
+  let apiRequests = 0;
+  globalThis.fetch = async (input) => {
+    if (String(input).includes("/api/token")) return token();
+    apiRequests++;
+    return json({}, 429, { "retry-after": new Date(Date.now() + 60_000).toUTCString() });
+  };
+  const { resolveSpotifyUrl } = await freshResolver();
+  await assert.rejects(resolveSpotifyUrl("spotify:track:offline"), { code: "SPOTIFY_RATE_LIMITED", status: 429 });
+  await assert.rejects(resolveSpotifyUrl("spotify:track:offline"), { code: "SPOTIFY_RATE_LIMITED", status: 429 });
+  assert.equal(apiRequests, 1);
+});
+
+test("a quota rejection on token renewal is retained between imports", async () => {
+  let requests = 0;
+  globalThis.fetch = async () => {
+    requests++;
+    return json({}, 429, { "retry-after": "60" });
+  };
+  const { resolveSpotifyUrl } = await freshResolver();
+  for (let index = 0; index < 2; index++) {
+    await assert.rejects(resolveSpotifyUrl("spotify:track:offline"), { code: "SPOTIFY_RATE_LIMITED", status: 429 });
+  }
+  assert.equal(requests, 1);
+});
+
+test("invalid Spotify JSON never leaks response snippets through resolver errors", async () => {
+  let tokenResponse = true;
+  globalThis.fetch = async (input) => {
+    if (String(input).includes("/api/token")) return tokenResponse ? new Response('{"access_token":"private-secret"') : token();
+    return new Response('{"private-secret":');
+  };
+  const { resolveSpotifyUrl } = await freshResolver();
+  await assert.rejects(resolveSpotifyUrl("spotify:track:offline"), { code: "SPOTIFY_TOKEN_INVALID", message: "Réponse d'authentification Spotify invalide." });
+  tokenResponse = false;
+  await assert.rejects(resolveSpotifyUrl("spotify:track:offline"), { code: "SPOTIFY_RESPONSE_INVALID", message: "Réponse de Spotify invalide. Réessaie dans un instant." });
+});
+
 test("hung Spotify response bodies are aborted and the resolver releases after bounded retries", async (t) => {
   const { resolveSpotifyUrl } = await freshResolver();
   t.mock.timers.enable({ apis: ["setTimeout"] });

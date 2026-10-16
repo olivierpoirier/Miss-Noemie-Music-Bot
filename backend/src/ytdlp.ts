@@ -3,7 +3,7 @@ import play from "play-dl";
 import { performance } from "node:perf_hooks";
 import { recordBackendMetric } from "./metrics.js";
 import { recordDiagnostic, diagnosticErrorDetails } from "./diagnostics.js";
-import { resolveSpotifyUrl, SpotifyResolverError } from "./spotify.js";
+import { resolveSpotifyUrl } from "./spotify.js";
 
 import { MPV_CONFIG, YTDLP_CONFIG } from "./config.js";
 import { ProbeResult, ResolvedItem } from "./types.js";
@@ -56,12 +56,23 @@ const SEARCH_PENDING = new Map<string, Promise<ResolvedItem | null>>();
 const SOUNDCLOUD_EXPAND_CACHE = new Map<string, CacheVal<string>>();
 
 const PLAY_DL_TIMEOUT_MS = 10_000;
+const MAX_PLAY_DL_PENDING = 3;
+let playDlPending = 0;
 
-async function withDeadline<T>(operation: Promise<T>, label: string): Promise<T> {
+async function withDeadline<T>(operation: () => Promise<T>, label: string): Promise<T> {
+  // play-dl does not expose cancellation of its HTTPS requests. A race timeout
+  // alone leaves the request alive; retain its slot until it really settles so
+  // repeated outages cannot accumulate an unbounded number of open requests.
+  if (playDlPending >= MAX_PLAY_DL_PENDING) throw new Error("Metadata provider unavailable");
+  playDlPending++;
+  const pending = Promise.resolve().then(operation).then(
+    (result) => { playDlPending--; return result; },
+    (error) => { playDlPending--; throw error; }
+  );
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
-      operation,
+      pending,
       new Promise<never>((_, reject) => {
         timeout = setTimeout(() => reject(new Error(`${label} timeout`)), PLAY_DL_TIMEOUT_MS);
       }),
@@ -344,19 +355,14 @@ function mapSingleDataToResolvedItem(data: any, url: string): ResolvedItem {
 }
 
 function mapYoutubeSearchResult(data: any, query: string): ResolvedItem | null {
-  const raw =
-    data?.url ||
-    data?.webpage_url ||
-    data?.original_url ||
-    data?.id ||
-    null;
-
-  let url: string | null = null;
-
-  if (typeof raw === "string" && /^https?:\/\//i.test(raw)) {
-    url = raw;
-  } else if (typeof raw === "string" && /^[a-zA-Z0-9_-]{11}$/.test(raw)) {
-    url = `https://www.youtube.com/watch?v=${raw}`;
+  // yt-dlp's `url` is often a short-lived googlevideo stream, whereas
+  // play-dl's `url` is a stable video page. Matches queued for later playback
+  // and persisted across restarts must always retain the stable page.
+  let url = [data?.webpage_url, data?.original_url, data?.url].find((value) =>
+    typeof value === "string" && /^https?:\/\//i.test(value) && isYoutubeUrl(value) && !isYoutubeSearchUrl(value)
+  ) as string | undefined;
+  if (!url && typeof data?.id === "string" && /^[a-zA-Z0-9_-]{11}$/.test(data.id)) {
+    url = `https://www.youtube.com/watch?v=${data.id}`;
   }
 
   if (!url) return null;
@@ -420,6 +426,8 @@ async function fetchJsonWithTimeout<T>(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   const startedAt = performance.now();
+  let status: number | undefined;
+  let ok = false;
 
   try {
     const res = await fetch(url, {
@@ -430,18 +438,20 @@ async function fetchJsonWithTimeout<T>(
       },
     });
 
-    recordBackendMetric("fetch-json", performance.now() - startedAt, res.ok, {
-      platform: getMediaPlatform(url),
-      status: res.status,
-    });
+    status = res.status;
 
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}`);
     }
 
-    return (await res.json()) as T;
+    const data = await res.json() as T;
+    ok = true;
+    return data;
   } finally {
     clearTimeout(timeout);
+    recordBackendMetric("fetch-json", performance.now() - startedAt, ok, {
+      platform: getMediaPlatform(url), status, timeout: controller.signal.aborted,
+    });
   }
 }
 
@@ -469,6 +479,7 @@ async function expandSoundCloudShortUrl(normalized: string): Promise<string> {
     });
 
     await res.body?.cancel().catch(() => {});
+    if (!res.ok) throw Object.assign(new Error("SoundCloud redirect unavailable"), { status: res.status });
 
     const finalUrl =
       typeof res.url === "string" && isSoundCloudUrl(res.url)
@@ -480,13 +491,17 @@ async function expandSoundCloudShortUrl(normalized: string): Promise<string> {
       status: res.status,
     });
 
-    cacheSet(SOUNDCLOUD_EXPAND_CACHE, normalized, finalUrl);
+    // A failed/unresolved short link is transient; caching it would mask a
+    // provider recovery for the entire metadata cache lifetime.
+    if (finalUrl !== normalized && !isSoundCloudShortUrl(finalUrl)) {
+      cacheSet(SOUNDCLOUD_EXPAND_CACHE, normalized, finalUrl);
+    }
     return finalUrl;
   } catch (err) {
     recordBackendMetric("soundcloud-expand", performance.now() - startedAt, false, {
       changed: false,
     });
-    console.warn("[soundcloud expand failed]", err);
+    recordDiagnostic("MEDIA_RESOLUTION_FALLBACK", { ...diagnosticErrorDetails(err), platform: "soundcloud", stage: "shortlink" });
     return normalized;
   } finally {
     clearTimeout(timeout);
@@ -521,7 +536,7 @@ async function resolveSoundCloudOEmbed(
         durationSec: 0,
       };
     } catch (err) {
-      console.warn("[soundcloud oembed failed]", err);
+      recordDiagnostic("MEDIA_RESOLUTION_FALLBACK", { ...diagnosticErrorDetails(err), platform: "soundcloud", stage: "metadata" });
     }
   }
 
@@ -652,14 +667,17 @@ export async function searchYoutubeVideo(
       recordBackendMetric("youtube-search", performance.now() - startedAt, Boolean(item), {
         source, limit, expectedDuration: Boolean(options.expectedDurationSec),
       });
-      if (!item) return null;
+      if (!item) {
+        recordDiagnostic("MEDIA_RESOLUTION_FAILED", { platform: "youtube", stage: "search", reason: "unavailable" });
+        return null;
+      }
       if (SEARCH_PENDING.get(resolutionKey) === task) {
         cacheSet(YOUTUBE_SEARCH_CACHE, cacheKey, { ...item }, Date.now() + YTDLP_CONFIG.searchCacheTTLMs);
       }
       return { ...item };
     };
     try {
-      const results = await withDeadline(play.search(trimmed, {
+      const results = await withDeadline(() => play.search(trimmed, {
         limit, source: { youtube: "video" },
       }), "YouTube search");
       const candidates = results.map((result) => mapYoutubeSearchResult(result, trimmed))
@@ -667,7 +685,7 @@ export async function searchYoutubeVideo(
       const item = pickBestYoutubeSearchResult(candidates, trimmed, options.expectedDurationSec);
       if (item) return finish(item, "play-dl");
     } catch (err) {
-      console.warn("[youtube search] play-dl failed; trying yt-dlp", err);
+      recordDiagnostic("MEDIA_RESOLUTION_FALLBACK", { ...diagnosticErrorDetails(err), platform: "youtube", stage: "search" });
     }
 
     try {
@@ -679,9 +697,7 @@ export async function searchYoutubeVideo(
         .filter((item): item is ResolvedItem => Boolean(item));
       const item = pickBestYoutubeSearchResult(candidates, trimmed, options.expectedDurationSec);
       if (item) return finish(item, "yt-dlp");
-    } catch (err) {
-      console.warn("[youtube search] yt-dlp failed", err);
-    }
+    } catch { /* The runner records classified process failures. */ }
     return finish(null, "none");
   })();
   SEARCH_PENDING.set(resolutionKey, task);
@@ -730,7 +746,7 @@ async function resolveSoundCloudItems(
 
     return [mapSingleDataToResolvedItem(data, normalized)];
   } catch (err) {
-    console.warn("[soundcloud resolve error]", err);
+    recordDiagnostic("MEDIA_RESOLUTION_FALLBACK", { ...diagnosticErrorDetails(err), platform: "soundcloud", stage: "playlist" });
     return null;
   }
 }
@@ -741,7 +757,7 @@ async function resolveYoutubePlaylistFast(
   if (!isYoutubeUrl(normalized) || !isPlaylistUrl(normalized)) return null;
 
   try {
-    const videos = await withDeadline((async () => {
+    const videos = await withDeadline(async () => {
       const playlist = await play.playlist_info(normalized, {
       incomplete: true,
       });
@@ -749,7 +765,7 @@ async function resolveYoutubePlaylistFast(
       // all_videos() fetched an entire large playlist before the 200-item cap.
       if (playlist.total_videos < 200) await playlist.fetch(200 - playlist.total_videos);
       return Array.from({ length: playlist.total_pages }, (_, page) => playlist.page(page + 1)).flat();
-    })(), "YouTube playlist");
+    }, "YouTube playlist");
 
     const items = videos
       .map((video: any) => {
@@ -780,10 +796,9 @@ async function resolveYoutubePlaylistFast(
 
     if (!items.length) return null;
 
-    console.log(`[playlist] YouTube fast resolver: ${items.length} titres`);
     return items;
   } catch (err) {
-    console.warn("[playlist] YouTube fast resolver failed", err);
+    recordDiagnostic("MEDIA_RESOLUTION_FALLBACK", { ...diagnosticErrorDetails(err), platform: "youtube", stage: "playlist" });
     return null;
   }
 }
@@ -808,8 +823,6 @@ async function runYtDlp(
   };
 
   return new Promise((resolve, reject) => {
-    console.log(`[yt-dlp] ${YTDLP_CONFIG.bin} ${finalArgs.join(" ")}`);
-
     const proc = spawn(YTDLP_CONFIG.bin, finalArgs, {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
@@ -826,11 +839,7 @@ async function runYtDlp(
 
       killProcessTree(proc);
       record(false, { timeout: true });
-      recordDiagnostic("YTDLP_TIMEOUT", { durationMs: Date.now() - startedAt, reason: "timeout" });
-
-      if (err.trim()) {
-        console.error("[yt-dlp timeout stderr]", err);
-      }
+      recordDiagnostic("YTDLP_TIMEOUT", { durationMs: Date.now() - startedAt, reason: "timeout", platform: getMediaPlatform(url) });
 
       reject(new Error("yt-dlp timeout"));
     }, opts?.timeoutMs ?? YTDLP_CONFIG.processTimeoutMs);
@@ -842,7 +851,7 @@ async function runYtDlp(
         finished = true;
         clearTimeout(timeout);
         killProcessTree(proc);
-        recordDiagnostic("YTDLP_PROCESS_FAILED", { durationMs: Date.now() - startedAt });
+        recordDiagnostic("YTDLP_PROCESS_FAILED", { durationMs: Date.now() - startedAt, platform: getMediaPlatform(url) });
         record(false, { outputLimit: true });
         reject(new Error("yt-dlp output exceeded 32 MiB"));
       }
@@ -856,9 +865,9 @@ async function runYtDlp(
       if (finished) return;
       finished = true;
       clearTimeout(timeout);
-      recordDiagnostic("YTDLP_PROCESS_FAILED", { ...diagnosticErrorDetails(spawnErr), durationMs: Date.now() - startedAt });
+      recordDiagnostic("YTDLP_PROCESS_FAILED", { ...diagnosticErrorDetails(spawnErr), durationMs: Date.now() - startedAt, platform: getMediaPlatform(url) });
       record(false, { spawnError: true });
-      reject(spawnErr);
+      reject(Object.assign(new Error("Impossible de démarrer yt-dlp."), { code: (spawnErr as NodeJS.ErrnoException).code }));
     });
 
     proc.on("close", (code) => {
@@ -871,11 +880,11 @@ async function runYtDlp(
         resolve(out.trim());
       } else {
         record(false, { exitCode: code });
-        recordDiagnostic("YTDLP_PROCESS_FAILED", { ...diagnosticErrorDetails(new Error(err)), durationMs: Date.now() - startedAt });
-        if (err.trim()) {
-          console.error("[yt-dlp error]", err);
-        }
-        reject(new Error(err || `Exit code ${code}`));
+        const details = diagnosticErrorDetails(new Error(err));
+        recordDiagnostic("YTDLP_PROCESS_FAILED", { ...details, ...(code !== null ? { exitCode: code } : {}), durationMs: Date.now() - startedAt, platform: getMediaPlatform(url) });
+        // stderr often contains private media URLs, cookie paths or queries.
+        // Preserve only the classified status when propagating to callers.
+        reject(Object.assign(new Error("L'extraction yt-dlp a échoué."), { status: details.status, code: details.reason }));
       }
     });
   });
@@ -889,11 +898,7 @@ export async function resolveSpotify(url: string): Promise<ResolvedItem[]> {
   try {
     return await resolveSpotifyUrl(url);
   } catch (err) {
-    if (err instanceof SpotifyResolverError) {
-      console.error("[spotify resolver error]", err.code, err.message);
-    } else {
-      console.error("[spotify resolver error]", err);
-    }
+    recordDiagnostic("MEDIA_RESOLUTION_FAILED", { ...diagnosticErrorDetails(err), platform: "spotify", stage: "metadata" });
     throw err;
   }
 }
@@ -967,7 +972,7 @@ export async function resolveUrlToPlayableItems(
         return hydrated;
       }
     } catch (err) {
-      console.error("[playlist resolve error]", err);
+      recordDiagnostic("MEDIA_RESOLUTION_FAILED", { ...diagnosticErrorDetails(err), platform: getMediaPlatform(normalized), stage: "playlist" });
       throw new Error("Impossible d'analyser cette playlist rapidement.");
     }
 
@@ -1038,7 +1043,7 @@ export async function probeSingle(url: string): Promise<ProbeResult> {
 
   if (play.yt_validate(normalized) === "video") {
     try {
-      const info = await withDeadline(play.video_info(normalized), "YouTube metadata");
+      const info = await withDeadline(() => play.video_info(normalized), "YouTube metadata");
 
       const res: ProbeResult = {
         title: info.video_details.title || "YouTube",
@@ -1050,7 +1055,8 @@ export async function probeSingle(url: string): Promise<ProbeResult> {
 
       cacheSet(PROBE_CACHE, normalized, res);
       return res;
-    } catch {
+    } catch (err) {
+      recordDiagnostic("MEDIA_RESOLUTION_FALLBACK", { ...diagnosticErrorDetails(err), platform: "youtube", stage: "metadata" });
       // fallback yt-dlp
     }
   }
@@ -1080,7 +1086,8 @@ export async function probeSingle(url: string): Promise<ProbeResult> {
 
     cacheSet(PROBE_CACHE, normalized, res);
     return res;
-  } catch {
+  } catch (err) {
+    recordDiagnostic("MEDIA_RESOLUTION_FAILED", { ...diagnosticErrorDetails(err), platform: getMediaPlatform(normalized), stage: "metadata" });
     return {
       title: getSourceLabel(normalized),
       thumb: buildFallbackThumb(getSourceLabel(normalized), normalized),
@@ -1307,7 +1314,7 @@ export async function getPlayableSource(
   const normalized = normalizeUrl(url);
 
   if (isYoutubeSearchUrl(normalized)) {
-    console.warn("[getPlayableSource] search URL refused:", normalized);
+    recordDiagnostic("MEDIA_RESOLUTION_FAILED", { platform: "youtube", stage: "search", reason: "unavailable" });
     return null;
   }
 
@@ -1360,24 +1367,25 @@ export async function getPlayableSource(
 
         const source = sourceFromYtDlpJson(JSON.parse(json), attempt.label);
 
+        if (source && (source.expiresAt ?? Infinity) <= Date.now()) {
+          // A successful extraction can already contain an unusable signed
+          // URL. Try the next extraction strategy before handing it to MPV.
+          recordDiagnostic("YTDLP_PROCESS_FAILED", { platform: getMediaPlatform(normalized), reason: "unavailable" });
+          return null;
+        }
+
         if (source) {
-          recordDiagnostic("YTDLP_SOURCE_RESOLVED");
+          recordDiagnostic("YTDLP_SOURCE_RESOLVED", { platform: getMediaPlatform(normalized) });
           if (DIRECT_PENDING.get(resolutionKey) === task && (source.expiresAt ?? 0) > Date.now()) {
             cacheSet(DIRECT_CACHE, cacheKey, source, source.expiresAt);
           }
-          console.log(
-            `[yt-dlp] playable source ${source.debugLabel || ""} ${
-              source.formatId || ""
-            } ${source.ext || ""}`.trim()
-          );
         }
 
         return source;
       } catch (err) {
-        console.warn(
-          `[getPlayableSource] extractor failed (${attempt.label})`,
-          err
-        );
+        // Process errors are already classified by the runner. JSON/shape
+        // errors must also remain visible without logging raw output.
+        recordDiagnostic("YTDLP_PROCESS_FAILED", { ...diagnosticErrorDetails(err), platform: getMediaPlatform(normalized) });
         return null;
       }
     };
@@ -1392,6 +1400,7 @@ export async function getPlayableSource(
       if (source) return source;
     }
 
+    recordDiagnostic("MEDIA_RESOLUTION_FAILED", { platform: getMediaPlatform(normalized), stage: "extraction", reason: "unavailable" });
     return null;
   })();
 

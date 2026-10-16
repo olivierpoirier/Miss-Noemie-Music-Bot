@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
 import { YTDLP_CONFIG } from "../src/config.js";
+import { diagnostics } from "../src/diagnostics.js";
 
 const originalConfig = { ...YTDLP_CONFIG };
 let directory: string;
@@ -21,11 +22,14 @@ beforeEach(() => {
     fs.appendFileSync(logPath, JSON.stringify(args) + '\\n');
     const run = fs.readFileSync(logPath, 'utf8').trim().split('\\n').length;
     const target = new URL(args.at(-1));
-    if (target.searchParams.has('fail')) process.exit(1);
+    if (target.searchParams.has('fail')) {
+      fs.writeSync(2, 'HTTP Error 403: https://private.invalid/audio?token=private-secret');
+      process.exit(1);
+    }
     if (target.searchParams.has('hang')) setInterval(() => {}, 1000);
     else setTimeout(() => {
     const output = {
-      url: 'https://media.invalid/audio?run=' + run + '&expire=' + (target.searchParams.get('expire') || Math.floor(Date.now() / 1000 + 600)),
+      url: 'https://media.invalid/audio?run=' + run + '&expire=' + (target.searchParams.get('expire') || Math.floor(Date.now() / 1000 + (target.searchParams.has('stale-first') && run === 1 ? -10 : 600))),
       format_id: 'offline-format', ext: 'm4a',
       http_headers: { 'User-Agent': 'offline-agent', Cookie: 'private', Authorization: 'private', 'Bad-Header': 'bad\\r\\nInjected: yes' }
     };
@@ -74,9 +78,30 @@ test("parallel source resolution shares one extraction and filters unsafe header
 test("expired signed sources are re-extracted instead of staying cached", async () => {
   const { getPlayableSource } = await freshResolver();
   const target = `https://fixture.invalid/track?expire=${Math.floor(Date.now() / 1000 - 10)}`;
-  await getPlayableSource(target);
-  await getPlayableSource(target);
+  assert.equal(await getPlayableSource(target), null, "an expired source must never reach the player");
+  assert.equal(await getPlayableSource(target), null);
   assert.equal(calls().length, 2);
+});
+
+test("an already expired YouTube extraction falls through to a fresh strategy before loading MPV", async () => {
+  const { getPlayableSource } = await freshResolver();
+  const source = await getPlayableSource("https://www.youtube.com/watch?v=offline1234&stale-first=1");
+  assert.ok(source?.expiresAt && source.expiresAt > Date.now());
+  assert.equal(calls().length, 2);
+});
+
+test("provider diagnostics retain HTTP failure classification without exposing media URLs or subprocess stderr", async (t) => {
+  const output: unknown[][] = [];
+  for (const method of ["log", "warn", "error"] as const) t.mock.method(console, method, (...args: unknown[]) => output.push(args));
+  const { getPlayableSource } = await freshResolver();
+  assert.equal(await getPlayableSource("https://fixture.invalid/track?fail=1&token=private-secret"), null);
+  const events = diagnostics.events();
+  assert.ok(events.some((event) => event.code === "YTDLP_PROCESS_FAILED" && event.details?.status === 403));
+  assert.ok(events.some((event) => event.code === "MEDIA_RESOLUTION_FAILED" && event.details?.platform === "generic" && event.details?.stage === "extraction"));
+  const observed = JSON.stringify({ output, events });
+  assert.ok(!observed.includes("private-secret"));
+  assert.ok(!observed.includes("private.invalid"));
+  assert.ok(!observed.includes("fixture.invalid"));
 });
 
 test("split extraction selects the audio stream instead of the first video-only format", async () => {

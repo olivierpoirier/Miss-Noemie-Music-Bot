@@ -88,9 +88,18 @@ export type DiagnosticDetails = {
   attempt?: number;
   trackId?: string;
   reason?: string;
+  platform?: string;
+  stage?: string;
+  activeUsers?: number;
+  itemCount?: number;
+  uptimeSec?: number;
+  rssMB?: number;
+  heapUsedMB?: number;
+  lagMs?: number;
 };
 
 export type DiagnosticEvent = {
+  runId?: string;
   timestamp: string;
   level: "info" | "warn" | "error";
   category: string;
@@ -119,5 +128,5 @@ export type DiagnosticSnapshot = {
   audioRouting: { ready: boolean; degraded: boolean; message: string | null };
   tools: { ytDlp: DiagnosticTool; mpv?: DiagnosticTool };
   recentEvents: DiagnosticEvent[];
-  logging: { enabled: boolean; available: boolean };
+  logging: { enabled: boolean; available: boolean; droppedWrites?: number; runId?: string };
 };

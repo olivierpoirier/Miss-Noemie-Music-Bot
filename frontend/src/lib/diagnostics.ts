@@ -52,12 +52,16 @@ function details(value: unknown): DiagnosticDetails | undefined {
   if (value == null) return undefined;
   const data = record(value);
   const result: DiagnosticDetails = {};
-  for (const key of ["status", "exitCode", "durationMs", "attempt"] as const) {
+  for (const key of ["status", "exitCode", "durationMs", "attempt", "activeUsers", "itemCount", "uptimeSec", "rssMB", "heapUsedMB", "lagMs"] as const) {
     if (data[key] !== undefined) result[key] = number(data[key]);
   }
+  if (typeof data.platform === "string" && ["youtube", "spotify", "soundcloud", "twitch", "direct", "generic", "unknown"].includes(data.platform)) result.platform = data.platform;
+  if (typeof data.stage === "string" && ["search", "metadata", "playlist", "shortlink", "extraction", "cache_load", "cache_write"].includes(data.stage)) result.stage = data.stage;
   if (typeof data.trackId === "string" && /^\d{1,12}$/.test(data.trackId)) result.trackId = data.trackId;
   if (typeof data.reason === "string" && [
     "timeout", "network", "unauthorized", "forbidden", "rate_limit", "unavailable",
+    "client_disconnect", "server_disconnect", "transport_close", "transport_error", "ping_timeout", "parse_error", "cancelled", "shutdown",
+    "listener_limit", "deprecated", "uncaught_exception", "unhandled_rejection", "SIGINT", "SIGTERM", "idle", "startup_failed", "http_error",
     "ENOENT", "EACCES", "EPERM", "ECONNRESET", "ECONNREFUSED", "EPIPE", "ENOTFOUND", "EADDRINUSE", "unknown",
   ].includes(data.reason)) result.reason = data.reason;
   return Object.keys(result).length ? result : undefined;
@@ -104,6 +108,7 @@ export function parseDiagnostics(value: unknown): DiagnosticSnapshot {
       if (level !== "info" && level !== "warn" && level !== "error") throw invalidResponse();
       const safeDetails = details(event.details);
       return {
+        ...(typeof event.runId === "string" && /^[a-f0-9-]{36}$/.test(event.runId) ? { runId: event.runId } : {}),
         timestamp: timestamp(event.timestamp),
         level,
         category: string(event.category),
@@ -112,7 +117,11 @@ export function parseDiagnostics(value: unknown): DiagnosticSnapshot {
         ...(safeDetails ? { details: safeDetails } : {}),
       };
     }).sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp)).slice(0, 100),
-    logging: { enabled: boolean(logging.enabled), available: boolean(logging.available) },
+    logging: {
+      enabled: boolean(logging.enabled), available: boolean(logging.available),
+      ...(logging.droppedWrites === undefined ? {} : { droppedWrites: number(logging.droppedWrites) }),
+      ...(typeof logging.runId === "string" && /^[a-f0-9-]{36}$/.test(logging.runId) ? { runId: logging.runId } : {}),
+    },
   };
 }
 

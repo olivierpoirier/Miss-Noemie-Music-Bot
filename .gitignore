@@ -17,6 +17,8 @@ node_modules
 **/dist/
 **/dist-vercel/
 **/build/
+# Local video downloads at the repository root are not application assets.
+/*.webm
 # testing
 /coverage
 

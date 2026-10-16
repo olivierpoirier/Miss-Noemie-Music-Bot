@@ -210,9 +210,10 @@ Cette séparation est importante: le mode local doit continuer à servir `fronte
 | `LINUX_VIRTUAL_SINK_NAME` | Nom du sink Linux, `xmbot_sink` par défaut; sa source `.monitor` doit être présente. |
 | `DIAGNOSTICS_ENABLED` | Journal persistant activé par défaut; `false` conserve uniquement les événements en mémoire. |
 | `DIAGNOSTICS_LOG_DIR` | Dossier du journal, `.data/logs` à la racine du projet par défaut. |
+| `DIAGNOSTICS_HEARTBEAT_MS` | Intervalle des relevés de mémoire et de réactivité, 5 minutes par défaut; entre 30 secondes et une heure. |
 | `DIAGNOSTICS_MAX_BYTES` | Taille maximale par fichier de journal, 1 Mio par défaut; trois fichiers au maximum. |
 
-Le bot continue à jouer lorsque le navigateur se ferme ou que le tunnel se reconnecte. En cas de sortie de mpv ou d'absence de progression pendant 60 secondes hors pause, le lecteur tente une fois de relancer la piste avec une URL fraîche, puis passe à la suivante si elle échoue encore. Une reprise automatique recommence la piste au début.
+Le bot continue à jouer lorsque le navigateur se ferme ou que le tunnel se reconnecte. En cas de sortie de mpv ou d'absence de progression pendant 60 secondes hors pause, le lecteur tente une fois de relancer la piste avec une URL fraîche, puis passe à la suivante si elle échoue encore. Une reprise automatique recommence la piste au début. Après 30 secondes de progression réelle, le budget de récupération est rétabli pour supporter plusieurs incidents espacés pendant un flux long; les échecs rapprochés restent bornés.
 
 Les appels Spotify et les résolutions de médias ont des délais limités. Certaines playlists Spotify peuvent être refusées par l'API même si leur page web est publique; consulte les [conditions d'accès de Spotify](https://developer.spotify.com/documentation/web-api/reference/get-playlists-items).
 
@@ -223,6 +224,8 @@ Les appels Spotify et les résolutions de médias ont des délais limités. Cert
 Le cache de correspondances conserve les pages YouTube trouvées pour Spotify et les replis SoundCloud. Il se recharge au démarrage depuis `backend/.data/provider-match-cache.json`, ignoré par Git. Les URL audio temporaires ou signées restent exclues du fichier; chaque lecture peut obtenir un nouveau flux. Le cache ne sauvegarde ni la file ni l'historique.
 
 Le panneau **Diagnostic du bot** affiche l'état du serveur, de mpv et du routage, les erreurs récentes et le chemin exact des outils. Il se rafraîchit uniquement lorsqu'il est ouvert et que l'onglet est visible. Un export JSON permet de conserver un relevé pour un diagnostic.
+
+`npm run logs` affiche les 100 derniers événements et `npm run logs -- --follow` suit le journal en direct, y compris après rotation. Les erreurs fatales, imports, reconnexions, replis de résolution et relevés périodiques de mémoire sont conservés sans enregistrer les liens ou identifiants privés.
 
 `npm run doctor` vérifie les versions des exécutables réellement configurés. `npm run update:ytdlp` met à jour cette copie de yt-dlp explicitement, y compris celle installée dans le backend; la commande nécessite une connexion réseau et les droits d'écriture sur l'exécutable. Aucune mise à jour automatique n'est effectuée pendant la lecture. Voir le [guide de diagnostic](docs/DIAGNOSTICS.md).
 

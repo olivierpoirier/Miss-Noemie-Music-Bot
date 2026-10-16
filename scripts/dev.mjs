@@ -5,6 +5,7 @@ import net from "node:net";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { startRestartingProcess } from "./restartProcess.mjs";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const withTunnel = process.argv.includes("--tunnel");
@@ -18,6 +19,7 @@ const stableTunnelName = process.env.CLOUDFLARE_TUNNEL_NAME || "music-bot";
 
 // Retain exited parents too: descendants may still belong to their group.
 const children = new Set();
+const stopOptionalProcesses = new Set();
 let shuttingDown = false;
 
 function prefixLines(label, chunk) {
@@ -29,12 +31,13 @@ function prefixLines(label, chunk) {
   }
 }
 
-function startProcess(label, command, args, cwd) {
+function startProcess(label, command, args, cwd, { critical = true } = {}) {
   const child = spawn(command, args, {
     cwd,
     env: {
       ...process.env,
       FORCE_COLOR: process.env.FORCE_COLOR || "1",
+      PORT: String(backendPort),
       XMB_BACKEND_PORT: String(backendPort),
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -48,15 +51,20 @@ function startProcess(label, command, args, cwd) {
   child.stderr?.on("data", (chunk) => prefixLines(label, chunk));
 
   child.on("error", (error) => {
-    console.error(`[${label}] ${error.message}`);
-    shutdown(1);
+    console.error(`[${label}] ${critical ? error.message : "Demarrage impossible. L'application locale reste disponible."}`);
+    if (critical) shutdown(1);
   });
 
   child.on("exit", (code, signal) => {
     if (shuttingDown) return;
 
     console.error(`[${label}] ${signal ? `stopped by ${signal}` : `exited with code ${code}`}`);
-    shutdown(code || 1);
+    if (critical) shutdown(code || 1);
+  });
+  child.on("close", () => {
+    // cloudflared has no managed descendants; completed retries must not keep
+    // accumulating process objects during long-running sessions.
+    if (!critical) children.delete(child);
   });
 
   return child;
@@ -143,6 +151,7 @@ function killTree(child, signal = "SIGTERM") {
 function shutdown(code = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
+  for (const stop of stopOptionalProcesses) stop();
 
   const processes = [...children];
   if (processes.length === 0) process.exit(code);
@@ -220,27 +229,24 @@ async function main() {
 
   if (withStableTunnel) {
     console.log(`[dev] Demarrage du tunnel Cloudflare nomme: ${stableTunnelName}`);
-    startProcess(
+    startTunnel([
       "tunnel",
-      "cloudflared",
-      [
-        "tunnel",
-        "run",
-        "--url",
-        `http://localhost:${frontendPort}`,
-        stableTunnelName,
-      ],
-      rootDir
-    );
+      "run",
+      "--url",
+      `http://localhost:${frontendPort}`,
+      stableTunnelName,
+    ]);
   } else if (withTunnel) {
     console.log("[dev] Demarrage du tunnel Cloudflare...");
-    startProcess(
-      "tunnel",
-      "cloudflared",
-      ["tunnel", "--url", `http://localhost:${frontendPort}`],
-      rootDir
-    );
+    startTunnel(["tunnel", "--url", `http://localhost:${frontendPort}`]);
   }
+}
+
+function startTunnel(args) {
+  stopOptionalProcesses.add(startRestartingProcess(
+    () => startProcess("tunnel", "cloudflared", args, rootDir, { critical: false }),
+    { onRetry: (delayMs) => console.error(`[tunnel] Reconnexion dans ${delayMs / 1000}s. L'application locale reste disponible.`) }
+  ));
 }
 
 main().catch((error) => {

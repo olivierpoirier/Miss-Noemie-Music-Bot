@@ -46,7 +46,7 @@ Les correctifs npm compatibles avec les versions déclarées ont été appliqué
 ## Limites à connaître
 
 - **Spotify** : la documentation actuelle limite l'accès aux éléments d'une playlist aux propriétaires ou collaborateurs et peut répondre 403. Une page Spotify publique ne garantit donc pas l'accès API avec les seuls identifiants de l'application. Les métadonnées Spotify sont ensuite recherchées sur YouTube : l'audio reste dépendant de cette seconde plateforme. [Documentation Spotify](https://developer.spotify.com/documentation/web-api/reference/get-playlists-items).
-- **Cookies suivis par Git** : `backend/cookies.txt` est toujours suivi malgré `.gitignore`. Ne pas le publier. Retirer son suivi et renouveler les sessions s'il a déjà été partagé; une purge d'historique Git doit être préparée séparément. Son contenu local n'a pas été modifié par cet audit.
+- **Cookies** : depuis la fusion, les fichiers cookies locaux sont ignorés et aucun n'est suivi dans la version actuelle. Les copies locales sont conservées; l'historique Git antérieur n'a pas été réécrit.
 - **Contrôle partagé** : le bot reste un contrôleur partagé sans authentification. Toute personne ayant accès à son adresse peut utiliser ses commandes. Le tunnel doit rester limité au groupe auquel tu souhaites donner ce contrôle.
 - **Persistance** : file et historique restent en mémoire, comme avant. Un redémarrage complet du serveur les efface. La démo Vercel possède aussi un état mémoire dépendant de l'instance qui répond.
 - **Appels de secours** : un délai JavaScript libère l'attente d'un appel play-dl, mais cette bibliothèque ne permet pas nécessairement d'annuler sa requête sous-jacente.
@@ -81,3 +81,32 @@ Le panneau **Diagnostic du bot** affiche l'état du serveur, du lecteur et du ro
 Validation de cette étape : **83 tests réussis** (64 backend, 19 frontend), compilation backend, builds local/Vercel et lint réussis. Chrome a aussi vérifié le développement Vite avec les modules ESM partagés, l'accès au diagnostic malgré une panne audio simulée, l'affichage de la version et de son avertissement, l'absence de débordement mobile, l'arrêt du polling à la fermeture et l'absence d'erreurs JavaScript non traitées. Les services audio de ces scénarios sont simulés; les identifiants privés n'ont pas été utilisés. Le contrôle local a confirmé yt-dlp `2026.03.17` et mpv `0.37.0`; yt-dlp est signalé comme ancien et n'a pas été mis à jour automatiquement.
 
 Le [guide de diagnostic](DIAGNOSTICS.md) décrit les commandes, les champs et la conservation des journaux.
+
+
+## Vérification complémentaire des interruptions et des logs
+
+Cette vérification complète les étapes historiques ci-dessus. Les pannes suivantes ont été reproduites par des tests isolés puis corrigées :
+
+| Défaut | Comportement corrigé |
+| --- | --- |
+| Sortie du tunnel Cloudflare traitée comme une panne de toute l'application | Backend et musique restent actifs; relance du tunnel avec délai progressif borné. |
+| mpv signale un fichier chargé puis s'arrête; événements tardifs trompeurs | Démarrage invalidé, reprise immédiate et anciens événements ignorés. |
+| Une seule reprise disponible pendant toute la durée d'un flux long | Budget réarmé après 30 secondes de progression effective, avec échecs rapprochés toujours bornés. |
+| Recherche YouTube de secours conservant parfois le flux signé | Conservation de la page vidéo stable; nouveau flux extrait au moment de la lecture. |
+| Source déjà expirée renvoyée à mpv | Rejet avant lecture, puis stratégie suivante. |
+| Délais JavaScript laissant s'accumuler les appels play-dl non annulables | Trois opérations réelles au maximum, puis repli yt-dlp avec processus arrêtables. |
+| Nouveaux ajouts Spotify ignorant le délai de quota d'une requête précédente | Délai mémorisé par service, formats secondes/date HTTP pris en compte. |
+| Déconnexion du navigateur débloquant un import encore actif | Confirmation attendue après reconnexion et verrou borné à cinq minutes. |
+| Déconnexion explicite Socket.IO sans reconnexion automatique | Nouvelle connexion programmée et annulée correctement au démontage. |
+| Causes d'échec visibles seulement dans la console ou remplacées par une erreur générique | Événements persistants avec codes, motifs normalisés, plateforme, étape et durée. |
+
+Les journaux portent un identifiant de session, conservent une place pour les erreurs fatales même après saturation et exposent les écritures perdues. Un relevé de mémoire et de réactivité est enregistré au démarrage puis toutes les cinq minutes. Les commandes `npm run logs` et `npm run logs -- --follow` relisent un historique filtré; les sorties du tunnel restent dans la console du lanceur.
+
+L'audit des dépendances de production du backend et du frontend ne signale aucune vulnérabilité. Aucune migration majeure de dépendance n'a été nécessaire pour ces corrections.
+
+Ces tests ne prouvent pas une cause unique pour les interruptions observées toutes les deux semaines. Les cookies, autorisations ou quotas des plateformes, leur disponibilité et le routage audio du système restent des dépendances externes. Un arrêt système brutal peut empêcher la dernière écriture. Les requêtes play-dl déjà bloquées ne sont pas annulables par cette bibliothèque, mais leur nombre est désormais plafonné.
+
+
+Validation de cette vérification : **136 tests réussis** (112 backend, 24 frontend), aucun échec ni test ignoré. Compilation backend, builds local/Vercel et lint réussis. Les tests d'erreur fatale utilisent de vrais processus Node isolés; les tests audio, fournisseurs et tunnel utilisent des services simulés sans identifiants privés. Les exécutables installés ont été vérifiés sans lecture audio : yt-dlp `2026.08.19`, mpv `0.37.0`.
+
+Chrome a également validé les nouveaux événements de mémoire et de session, leur affichage mobile sans débordement, l'accès malgré une panne audio simulée, l'arrêt des consultations à la fermeture du panneau et l'absence d'erreurs JavaScript non traitées.

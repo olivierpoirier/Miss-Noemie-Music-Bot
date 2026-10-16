@@ -80,6 +80,7 @@ export class MpvInstance extends EventEmitter {
   private startError: Error | null = null;
   private terminalError: Error | null = null;
   private awaitingFileStart = false;
+  private streamFailureReported = false;
   private requestId = 0;
   private commands = new Map<number, { resolve: () => void; reject: (error: Error) => void }>();
   private playbackWaiters = new Set<{ resolve: () => void; reject: (error: Error) => void }>();
@@ -185,6 +186,7 @@ export class MpvInstance extends EventEmitter {
     this.started = false;
     this.startError = null;
     this.awaitingFileStart = true;
+    this.streamFailureReported = false;
   }
 
   /* ------------------- PRIVATE ------------------- */
@@ -194,6 +196,14 @@ export class MpvInstance extends EventEmitter {
       const line = data.toString().trim();
       if (!line) return;
 
+      // libavformat is normally quieted below, but its 403 is often the only
+      // explanation for an expired URL/cookie before MPV sends a generic error.
+      if (/\b403\b/.test(line) && /forbidden|http/i.test(line)) {
+        this.reportStreamFailure(new Error("HTTP 403"));
+        console.error("🛑 [MPV] Erreur 403 pendant la lecture du flux audio.");
+        return;
+      }
+
       if (
         line.includes("segment") ||
         line.includes("Opening 'https") ||
@@ -201,11 +211,6 @@ export class MpvInstance extends EventEmitter {
       ) {
         this.lastLogs.push(`[SILENT] ${line}`);
         if (this.lastLogs.length > 50) this.lastLogs.shift();
-        return;
-      }
-
-      if (line.includes("403 Forbidden")) {
-        console.error("🛑 [MPV] Erreur 403 pendant la lecture du flux audio.");
         return;
       }
 
@@ -294,8 +299,16 @@ export class MpvInstance extends EventEmitter {
       const reason = typeof obj.reason === "string" ? obj.reason : undefined;
       const error = typeof obj.error === "string" ? obj.error : undefined;
 
-      if (!this.started || reason === "error") {
+      if (reason === "error") this.reportStreamFailure(new Error(error || "Échec du flux MPV"));
+
+      // file-loaded can precede an immediate stop/quit. A caller may only begin
+      // waiting after that sequence, so the successful load must not hide the
+      // interruption and leave the player silent until its 60-second watchdog.
+      if (!this.started || reason === "error" || reason === "stop" || reason === "quit") {
         this.started = false;
+        // time-pos/playback-restart may already be queued on the IPC stream.
+        // Once this file has ended, only a new start-file can own such events.
+        this.awaitingFileStart = true;
         this.startError = new Error(
           `MPV n'a pas pu ouvrir le flux${reason ? ` (${reason})` : ""}${
             error ? `: ${error}` : ""
@@ -334,6 +347,12 @@ export class MpvInstance extends EventEmitter {
   private markStarted(): void {
     this.started = true;
     this.settlePlayback();
+  }
+
+  private reportStreamFailure(error: Error): void {
+    if (this.streamFailureReported) return;
+    this.streamFailureReported = true;
+    recordDiagnostic("MPV_STREAM_FAILED", diagnosticErrorDetails(error));
   }
 
   private settlePlayback(error?: Error): void {

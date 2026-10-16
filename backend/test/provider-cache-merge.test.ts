@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
 import { PLAYER_CONFIG } from "../src/config.js";
+import { diagnostics } from "../src/diagnostics.js";
 
 const original = { ...PLAYER_CONFIG };
 let directory: string;
@@ -68,9 +69,19 @@ test("corrupt provider cache is ignored and replaced by a valid version", async 
   fs.writeFileSync(cachePath, "{invalid json");
   const cache = await fresh();
   assert.equal(cache.getProviderMatchCacheSize(), 0);
+  assert.ok(diagnostics.events().some((event) => event.code === "PROVIDER_CACHE_FAILED" && event.details?.stage === "cache_load"));
   cache.setProviderMatch("valid", match("abcdefghijk"));
   await cache.flushProviderMatchCache();
   assert.equal(JSON.parse(fs.readFileSync(cachePath, "utf8")).version, 1);
+});
+
+test("provider cache persistence failures are diagnosed while memory matching remains available", async () => {
+  const cache = await fresh();
+  fs.mkdirSync(cachePath);
+  cache.setProviderMatch("valid", match("abcdefghijk"));
+  await cache.flushProviderMatchCache();
+  assert.equal(cache.getProviderMatch("valid").url, match("abcdefghijk").url);
+  assert.ok(diagnostics.events().some((event) => event.code === "PROVIDER_CACHE_FAILED" && event.details?.stage === "cache_write"));
 });
 
 test("provider updates during an asynchronous write are included in the final snapshot", async () => {

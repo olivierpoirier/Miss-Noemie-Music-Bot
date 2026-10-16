@@ -47,6 +47,7 @@ let engineGeneration = 0;
 let playerLoopTask: Promise<void> | null = null;
 let loopRequested = false;
 let playbackGeneration = 0;
+let playbackSeekSequence = 0;
 let activeItem: QueueItem | null = null;
 let activeAbortController: AbortController | null = null;
 let preferredNextItem: QueueItem | null = null;
@@ -58,6 +59,7 @@ const playbackRetries = new Map<string, number>();
 const attemptedSources = new Map<string, { source: PlayableSource; pageUrl: string }>();
 const MAX_PLAYBACK_RETRIES = 1;
 const PLAYBACK_STALL_TIMEOUT_MS = 60_000;
+const PLAYBACK_RECOVERY_PROGRESS_SEC = 30;
 
 export function getPlayerDiagnostics() {
   const handle = globalMpvHandle;
@@ -371,6 +373,9 @@ function attachListener(
   detachPlaybackListener();
   let lastProgressAt = Date.now();
   let lastPosition = -1;
+  let observedSeekSequence = playbackSeekSequence;
+  let recoveryProgressSec = 0;
+  const recoveryStartedAt = Date.now();
 
   currentListener = (ev: MpvEvent) => {
     if (!isCurrentAttempt(item, generation) || playing?.handle !== handle) return;
@@ -397,12 +402,30 @@ function attachListener(
 
     if (ev.type !== "property-change") return;
 
-    if (ev.name === "time-pos" && typeof ev.data === "number") {
+    if (ev.name === "time-pos" && typeof ev.data === "number" && Number.isFinite(ev.data)) {
       const now = state.now;
       if (!now) return;
       if (Math.abs(ev.data - lastPosition) > 0.01) {
+        const progressedAt = Date.now();
+        const delta = ev.data - lastPosition;
+        const elapsedSec = Math.max(0, (progressedAt - lastProgressAt) / 1000);
+        if (observedSeekSequence !== playbackSeekSequence || delta > 5) {
+          recoveryProgressSec = 0;
+        } else if (!state.control.paused && delta > 0 && lastPosition >= 0 && playbackRetries.has(item.id)) {
+          // Re-arm recovery only after sustained real playback. file-loaded,
+          // seeks, a paused clock and bursts of property events prove nothing.
+          recoveryProgressSec += Math.min(delta, elapsedSec);
+          if (recoveryProgressSec >= PLAYBACK_RECOVERY_PROGRESS_SEC) {
+            playbackRetries.delete(item.id);
+            recordDiagnostic("PLAYBACK_RECOVERED", {
+              trackId: item.id,
+              durationMs: progressedAt - recoveryStartedAt,
+            });
+          }
+        }
+        observedSeekSequence = playbackSeekSequence;
         lastPosition = ev.data;
-        lastProgressAt = Date.now();
+        lastProgressAt = progressedAt;
       }
 
       const wasBuffering = Boolean(now.isBuffering);
@@ -474,6 +497,7 @@ async function tryPlayWith(
   onStateChange: () => void,
   generation: number
 ): Promise<boolean> {
+  const startedAt = performance.now();
   try {
     const handle = await ensureMpvRunning();
     if (!isCurrentAttempt(item, generation)) return false;
@@ -512,7 +536,14 @@ async function tryPlayWith(
     if (started) recordDiagnostic("PLAYBACK_STARTED", { trackId: item.id });
     return started;
   } catch (err) {
-    console.error("[player] play error", err);
+    if (isCurrentAttempt(item, generation)) {
+      console.error("[player] play error", err);
+      recordDiagnostic("PLAYBACK_START_FAILED", {
+        trackId: item.id,
+        durationMs: performance.now() - startedAt,
+        ...diagnosticErrorDetails(err),
+      });
+    }
     return false;
   }
 }
@@ -691,6 +722,9 @@ function handleEndOfTrack(item: QueueItem, onStateChange: () => void): void {
   if (item.status !== "playing") return;
 
   if (state.control.repeat) {
+    // Completing the file proves recovery too, including short repeated clips.
+    playbackRetries.delete(item.id);
+    attemptedSources.delete(item.id);
     item.status = "queued";
     preferredNextItem = item;
     cancelActiveAttempt();
@@ -878,6 +912,7 @@ export async function seekAbsolute(
 
   onStateChange();
   try {
+    ++playbackSeekSequence;
     await mpvSeekAbsolute(h, target);
   } catch (error) {
     if (state.now === now && generation === playbackGeneration &&

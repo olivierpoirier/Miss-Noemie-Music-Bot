@@ -3,6 +3,7 @@ import { promises as fsp } from "node:fs";
 import path from "node:path";
 import { PLAYER_CONFIG } from "./config.js";
 import { isSoundCloudUrl, isYoutubeSearchUrl, isYoutubeUrl, normalizeMediaUrl } from "./platforms/index.js";
+import { recordDiagnostic, diagnosticErrorDetails } from "./diagnostics.js";
 
 /** A stable provider page match, never an extracted/signed audio stream. */
 export type ProviderMatch = {
@@ -87,7 +88,7 @@ function load(): void {
     }
     trim();
   } catch (error) {
-    console.warn("[provider-cache] failed to load", error instanceof Error ? error.name : "unknown");
+    recordDiagnostic("PROVIDER_CACHE_FAILED", { ...diagnosticErrorDetails(error), stage: "cache_load" });
   }
 }
 
@@ -133,7 +134,7 @@ export async function flushProviderMatchCache(): Promise<void> {
       await fsp.rename(temp, target);
     } catch (error) {
       await fsp.unlink(temp).catch(() => {});
-      console.warn("[provider-cache] failed to persist", error instanceof Error ? error.name : "unknown");
+      recordDiagnostic("PROVIDER_CACHE_FAILED", { ...diagnosticErrorDetails(error), stage: "cache_write" });
     }
   })();
   try {

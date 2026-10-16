@@ -66,6 +66,7 @@ function useSocketQueue() {
     });
 
     socketRef.current = s;
+    let reconnectTimer: number | null = null;
 
     s.on("state", (payload: QueueResponse) => {
       const queue = payload.queue ?? [];
@@ -123,22 +124,36 @@ function useSocketQueue() {
     });
 
     s.on("connect", () => {
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      reconnectTimer = null;
       setToast("🔗 Connecté au serveur");
       setSystemError(null);
     });
 
     s.on("connect_error", () => {
       setToast("⚡ Serveur inaccessible. Reconnexion automatique…");
-      clearBusy();
+      if (!activeRequestRef.current) clearBusy();
     });
 
-    s.on("disconnect", () => {
-      setToast("⚡ Connexion perdue");
-      activeRequestRef.current = null;
-      clearBusy();
+    s.on("disconnect", (reason: string) => {
+      setToast(activeRequestRef.current
+        ? "⚡ Connexion perdue. L'ajout reste en attente de confirmation."
+        : "⚡ Connexion perdue");
+      // The server can finish an import while this browser reconnects. Keep
+      // its request until the next state/ack or deadline to prevent a second add.
+      if (!activeRequestRef.current) clearBusy();
+      if (reason === "io server disconnect" && reconnectTimer === null) {
+        // Socket.IO automatically reconnects transport failures, but an
+        // explicit server disconnect requires a new connect() call.
+        reconnectTimer = window.setTimeout(() => {
+          reconnectTimer = null;
+          s.connect();
+        }, 1_000);
+      }
     });
 
     return () => {
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       socketRef.current = null;
       s.removeAllListeners();
       s.close();

@@ -149,6 +149,12 @@ export default function DiagnosticsPanel({ theme, rainbow = false, open, onOpenC
                       <dd className="mt-1 text-sm font-medium">
                         {!snapshot.logging.enabled ? "Désactivé" : snapshot.logging.available ? "Actif" : "Indisponible"}
                       </dd>
+                      {snapshot.logging.runId && <dd className="mt-1 font-mono text-xs text-muted">Session {snapshot.logging.runId.slice(0, 8)}</dd>}
+                      {Boolean(snapshot.logging.droppedWrites) && (
+                        <dd className="mt-1 text-xs leading-5 text-amber-200" role="status">
+                          {snapshot.logging.droppedWrites} événement(s) n'ont pas pu être sauvegardés. Vérifie l'espace disque et les permissions du journal.
+                        </dd>
+                      )}
                       <dd className="mt-1 text-xs leading-5 text-muted">Le rapport exporté contient ce relevé et les événements récents.</dd>
                     </div>
                   </dl>
@@ -170,16 +176,30 @@ export default function DiagnosticsPanel({ theme, rainbow = false, open, onOpenC
                             <span className={event.level === "error" ? "text-red-300" : event.level === "warn" ? "text-amber-200" : "text-muted"}>{severity[event.level]}</span>
                             <time className="text-muted" dateTime={event.timestamp}>{dateTime(event.timestamp)}</time>
                             <span className="break-all font-mono text-muted">{event.category} / {event.code}</span>
+                            {event.runId && (
+                              <span className="text-muted">
+                                Session {event.runId.slice(0, 8)}{snapshot.logging.runId && event.runId !== snapshot.logging.runId ? " (précédente)" : ""}
+                              </span>
+                            )}
                           </div>
                           <p className="mt-1 break-words text-sm leading-6">{event.message}</p>
                           {event.details && (
                             <p className="mt-1 break-words text-xs leading-5 text-muted">
                               {[
+                                event.details.trackId && `Piste #${event.details.trackId}`,
+                                event.details.platform && `Plateforme : ${event.details.platform}`,
+                                event.details.stage && `Étape : ${event.details.stage}`,
                                 event.details.status !== undefined && `HTTP ${event.details.status}`,
                                 event.details.exitCode !== undefined && `Code de sortie : ${event.details.exitCode}`,
                                 event.details.reason && `Motif : ${event.details.reason}`,
                                 event.details.attempt !== undefined && `Tentative : ${event.details.attempt}`,
                                 event.details.durationMs !== undefined && `Durée : ${event.details.durationMs} ms`,
+                                event.details.activeUsers !== undefined && `${event.details.activeUsers} interface(s) connectée(s)`,
+                                event.details.itemCount !== undefined && `${event.details.itemCount} titre(s)`,
+                                event.details.uptimeSec !== undefined && `Actif depuis ${uptime(event.details.uptimeSec)}`,
+                                event.details.rssMB !== undefined && `Mémoire totale : ${event.details.rssMB} Mio`,
+                                event.details.heapUsedMB !== undefined && `Mémoire JS : ${event.details.heapUsedMB} Mio`,
+                                event.details.lagMs !== undefined && `Retard du serveur : ${event.details.lagMs} ms`,
                               ].filter(Boolean).join(" · ")}
                             </p>
                           )}

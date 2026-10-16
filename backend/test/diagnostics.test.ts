@@ -121,3 +121,48 @@ test("process exit codes remain distinct from HTTP statuses", async () => {
   store.record("MPV_EXITED", { exitCode: 7, status: 7 });
   assert.deepEqual(store.events()[0].details, { exitCode: 7 });
 });
+
+
+test("saturated writes remain bounded and report how many events were not saved", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "xmb-diagnostic-pressure-"));
+  try {
+    const store = createDiagnosticStore(options(directory));
+    await store.initialize();
+    for (let index = 0; index < 1_000; index++) store.record("PLAYBACK_RETRY", { attempt: index });
+    assert.equal(store.status().droppedWrites, 800);
+    assert.equal(store.events().length, 100);
+    store.record("PROCESS_UNCAUGHT_EXCEPTION", { reason: "unknown" });
+    await store.flush();
+    const restored = createDiagnosticStore(options(directory));
+    await restored.initialize();
+    assert.equal(restored.events()[0].code, "PROCESS_UNCAUGHT_EXCEPTION");
+    assert.equal(store.status().available, true);
+    assert.equal(store.status().droppedWrites, 800);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("new sessions preserve previous session identifiers and sanitize added diagnostic context", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "xmb-diagnostic-sessions-"));
+  try {
+    const first = createDiagnosticStore(options(directory));
+    first.record("MEDIA_RESOLUTION_FALLBACK", {
+      platform: "youtube", stage: "extraction", activeUsers: 2, itemCount: 7,
+      uptimeSec: 600, rssMB: 120, heapUsedMB: 40, lagMs: 7,
+      token: "secret", url: "secret", reason: "secret",
+    } as any);
+    await first.flush();
+    const second = createDiagnosticStore(options(directory));
+    await second.initialize();
+    assert.equal(second.events()[0].runId, first.status().runId);
+    assert.notEqual(first.status().runId, second.status().runId);
+    assert.deepEqual(second.events()[0].details, {
+      platform: "youtube", stage: "extraction", activeUsers: 2, itemCount: 7,
+      uptimeSec: 600, rssMB: 120, heapUsedMB: 40, lagMs: 7,
+    });
+    assert.equal((await readFile(path.join(directory, "events.ndjson"), "utf8")).includes("secret"), false);
+    second.record("MEDIA_RESOLUTION_FAILED", { platform: "secret", stage: "secret" });
+    assert.equal(second.events()[0].runId, second.status().runId);
+    assert.equal(second.events()[0].details, undefined);
+    await second.flush();
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});

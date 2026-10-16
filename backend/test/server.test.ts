@@ -113,8 +113,12 @@ test("invalid socket payloads cannot crash the server; failed adds are acknowled
     const state = await socket.waitFor("state", (state) => state.control.randomMode);
     assert.equal(state.control.randomMode, true);
     socket.ws.close();
-    await delay(100);
-    const health = await (await fetch(`${server.url}/health`)).json();
+    let health: any;
+    for (let i = 0; i < 100; i++) {
+      health = await (await fetch(`${server.url}/health`)).json();
+      if (health.activeUsers === 0) break;
+      await delay(20);
+    }
     assert.equal(health.idleShutdownMs, 0);
     assert.equal(health.activeUsers, 0);
     assert.equal(server.child.exitCode, null);
@@ -132,6 +136,9 @@ test("diagnostics expose exact tools and retained failures without exposing cred
     socket = await connect(server.url);
     socket.emit("command", null);
     await socket.waitFor("toast");
+    socket.emit("play", { url: `private-search-${secret}`, clientRequestId: "diagnostic-add" });
+    const addResult = await socket.waitFor("play_result", (result) => result.clientRequestId === "diagnostic-add");
+    assert.equal(addResult.ok, false);
     const response = await fetch(`${server.url}/diagnostics`);
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("cache-control"), "no-store");
@@ -145,11 +152,24 @@ test("diagnostics expose exact tools and retained failures without exposing cred
     assert.equal(data.audioRouting.ready, false);
     assert.equal(data.logging.enabled, true);
     assert.ok(data.recentEvents.some((event: any) => event.code === "SOCKET_COMMAND_FAILED"));
+    assert.ok(data.recentEvents.some((event: any) => event.code === "SOCKET_CONNECTED" && event.details.activeUsers === 1));
+    assert.ok(data.recentEvents.some((event: any) => event.code === "QUEUE_ADD_STARTED"));
+    const failedAdd = data.recentEvents.find((event: any) => event.code === "QUEUE_ADD_FAILED");
+    assert.ok(failedAdd.details.durationMs >= 0);
     assert.equal(JSON.stringify(data).includes(secret), false);
     assert.equal(JSON.stringify(data).includes("clientSecret"), false);
     assert.equal(JSON.stringify(data).includes("refreshToken"), false);
     const cached = await (await fetch(`${server.url}/diagnostics`)).json();
     assert.equal(cached.tools.ytDlp.checkedAt, data.tools.ytDlp.checkedAt);
+    socket.ws.close();
+    let disconnected: any;
+    for (let i = 0; i < 100 && !disconnected; i++) {
+      const latest = await (await fetch(`${server.url}/diagnostics`)).json();
+      disconnected = latest.recentEvents.find((event: any) => event.code === "SOCKET_DISCONNECTED");
+      if (!disconnected) await delay(10);
+    }
+    assert.equal(disconnected.details.activeUsers, 0);
+    assert.equal(disconnected.details.reason, "transport_close");
   } finally {
     socket?.ws.close();
     await server.stop();
@@ -218,6 +238,8 @@ test("rate-limited additions still acknowledge their request and the budget rese
     const result = await socket.waitFor("play_result", (data) => data.clientRequestId === "rate-limited");
     assert.equal(result.ok, false);
     assert.match(result.message, /Trop de commandes/);
+    const diagnostics = await (await fetch(`${server.url}/diagnostics`)).json();
+    assert.ok(diagnostics.recentEvents.some((event: any) => event.code === "SOCKET_RATE_LIMITED" && event.details.reason === "rate_limit"));
     await delay(550);
     socket.emit("command", { cmd: "random_mode", arg: false });
     await socket.waitFor("state", (state) => !state.control.randomMode);

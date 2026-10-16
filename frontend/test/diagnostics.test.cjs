@@ -130,3 +130,29 @@ test('HTTP and non-JSON responses yield a concise diagnostic error', async (t) =
   }));
   await assert.rejects(requestDiagnostics(), /diagnostics invalides/);
 });
+
+
+test('runtime and provider context survives export while arbitrary strings are excluded', async () => {
+  const { parseDiagnostics } = await diagnosticsModule;
+  const body = snapshot();
+  const runId = '12345678-1234-1234-1234-123456789abc';
+  body.logging = { ...body.logging, droppedWrites: 3, runId, token: 'private-secret' };
+  body.recentEvents[0].runId = runId;
+  body.recentEvents[0].details = {
+    platform: 'youtube', stage: 'extraction', reason: 'transport_close', activeUsers: 2, itemCount: 4,
+    uptimeSec: 600, rssMB: 120, heapUsedMB: 40, lagMs: 5, rawError: 'private-secret',
+  };
+  const parsed = parseDiagnostics(body);
+  assert.equal(parsed.logging.droppedWrites, 3);
+  assert.equal(parsed.logging.runId, runId);
+  assert.equal(parsed.recentEvents[0].runId, runId);
+  assert.deepEqual(parsed.recentEvents[0].details, {
+    platform: 'youtube', stage: 'extraction', reason: 'transport_close', activeUsers: 2, itemCount: 4,
+    uptimeSec: 600, rssMB: 120, heapUsedMB: 40, lagMs: 5,
+  });
+  assert.equal(JSON.stringify(parsed).includes('private-secret'), false);
+  body.recentEvents[0].details = { platform: 'private-secret', stage: 'private-secret', reason: 'private-secret' };
+  body.logging.runId = 'private-secret';
+  body.recentEvents[0].runId = 'private-secret';
+  assert.equal(JSON.stringify(parseDiagnostics(body)).includes('private-secret'), false);
+});

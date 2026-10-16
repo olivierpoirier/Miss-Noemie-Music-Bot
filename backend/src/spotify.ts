@@ -13,6 +13,9 @@ let tokenCache: SpotifyTokenCache = null;
 let skipRefreshToken = false;
 let tokenRequest: Promise<string> | null = null;
 let rotatedRefreshToken: string | undefined;
+// Quotas survive individual imports: repeated queue additions must not keep
+// hitting Spotify before the provider's Retry-After deadline has elapsed.
+const rateLimitUntil = new Map<string, number>();
 
 const REQUEST_TIMEOUT_MS = 12_000;
 const MAX_RETRIES = 2;
@@ -23,6 +26,14 @@ const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 
 /** The deadline includes reading the body; a server can stall after its headers. */
 async function spotifyRequest(url: string, init?: RequestInit) {
+  const quotaScope = new URL(url).hostname;
+  const blockedUntil = rateLimitUntil.get(quotaScope) || 0;
+  if (blockedUntil > Date.now()) {
+    recordDiagnostic("SPOTIFY_REQUEST_FAILED", { status: 429, reason: "rate_limit" });
+    throw new SpotifyResolverError("SPOTIFY_RATE_LIMITED", "Spotify limite temporairement les requêtes. Réessaie après la fin du délai imposé par Spotify.", 429);
+  }
+  rateLimitUntil.delete(quotaScope);
+
   for (let attempt = 0; ; attempt++) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -49,10 +60,17 @@ async function spotifyRequest(url: string, init?: RequestInit) {
     }
 
     const { response } = result;
-    const retryAfter = Number(response.headers.get("retry-after"));
-    const retryDelay = response.status === 429 && Number.isFinite(retryAfter) && retryAfter > 0
-      ? retryAfter * 1000
+    const retryAfter = response.headers.get("retry-after")?.trim();
+    // Retry-After accepts either seconds or an HTTP date.
+    const retryAfterMs = retryAfter && /^\d+(?:\.\d+)?$/.test(retryAfter)
+      ? Number(retryAfter) * 1_000
+      : retryAfter ? Date.parse(retryAfter) - Date.now() : NaN;
+    const retryDelay = response.status === 429 && Number.isFinite(retryAfterMs) && retryAfterMs >= 0
+      ? retryAfterMs
       : 250 * 2 ** attempt;
+    if (response.status === 429) {
+      rateLimitUntil.set(quotaScope, Date.now() + Math.max(250, retryDelay));
+    }
     if (
       attempt < MAX_RETRIES &&
       (response.status === 429 || response.status >= 500) &&
@@ -158,6 +176,7 @@ async function requestSpotifyAccessToken(): Promise<string> {
     });
 
     if (!res.ok) {
+      recordDiagnostic("SPOTIFY_REQUEST_FAILED", { status: res.status });
       const grantType = params.get("grant_type");
       const refreshTokenRevoked =
         grantType === "refresh_token" &&
@@ -165,6 +184,7 @@ async function requestSpotifyAccessToken(): Promise<string> {
         /invalid_grant|revoked|refresh token/i.test(body);
 
       throw new SpotifyResolverError(
+        res.status === 429 ? "SPOTIFY_RATE_LIMITED" :
         refreshTokenRevoked
           ? "SPOTIFY_REFRESH_TOKEN_REVOKED"
           : "SPOTIFY_TOKEN_REQUEST_FAILED",
@@ -173,15 +193,17 @@ async function requestSpotifyAccessToken(): Promise<string> {
       );
     }
 
-    const data = JSON.parse(body) as {
+    let data: {
       access_token: string;
       expires_in: number;
       refresh_token?: string;
     };
-    if (!data.access_token || !Number.isFinite(data.expires_in) || data.expires_in <= 0) {
+    try { data = JSON.parse(body); }
+    catch { throw new SpotifyResolverError("SPOTIFY_TOKEN_INVALID", "Réponse d'authentification Spotify invalide."); }
+    if (!data || typeof data.access_token !== "string" || !data.access_token || !Number.isFinite(data.expires_in) || data.expires_in <= 0) {
       throw new SpotifyResolverError("SPOTIFY_TOKEN_INVALID", "Réponse d'authentification Spotify invalide.");
     }
-    if (data.refresh_token) rotatedRefreshToken = data.refresh_token;
+    if (typeof data.refresh_token === "string" && data.refresh_token) rotatedRefreshToken = data.refresh_token;
     return data;
   };
 
@@ -205,9 +227,6 @@ async function requestSpotifyAccessToken(): Promise<string> {
       }
       skipRefreshToken = true;
       recordDiagnostic("SPOTIFY_REFRESH_REVOKED", diagnosticErrorDetails(error));
-      console.warn(
-        "[spotify] SPOTIFY_REFRESH_TOKEN is revoked; using client credentials for track/album metadata. Reauthorize Spotify to access your playlists."
-      );
 
       data = await requestToken(
         new URLSearchParams({ grant_type: "client_credentials" })
@@ -282,7 +301,12 @@ async function spotifyGet<T>(url: string): Promise<T> {
       );
     }
 
-    const parsed = JSON.parse(body) as T;
+    let parsed: T;
+    try { parsed = JSON.parse(body) as T; }
+    catch {
+      recordDiagnostic("SPOTIFY_REQUEST_FAILED", { reason: "unavailable" });
+      throw new SpotifyResolverError("SPOTIFY_RESPONSE_INVALID", "Réponse de Spotify invalide. Réessaie dans un instant.");
+    }
     ok = true;
     return parsed;
   } finally {
@@ -433,8 +457,6 @@ export async function resolveSpotifyUrl(url: string): Promise<ResolvedItem[]> {
       "URL Spotify invalide ou non supportée"
     );
   }
-
-  console.log("[spotify parsed]", parsed);
 
   if (parsed.type === "track") {
     const track = await spotifyGet<SpotifyTrack>(

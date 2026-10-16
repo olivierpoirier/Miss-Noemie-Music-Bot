@@ -6,6 +6,7 @@ import type net from "node:net";
 import { test } from "node:test";
 import { MpvInstance } from "../src/mpv.js";
 import { MPV_CONFIG } from "../src/config.js";
+import { diagnostics } from "../src/diagnostics.js";
 
 class FakeProcess extends EventEmitter {
   stdout = new PassThrough();
@@ -120,5 +121,49 @@ test("failed playback rejects promptly, even after file-loaded and before the ca
   socket.reply({ event: "file-loaded" });
   socket.reply({ event: "end-file", reason: "error", error: "network error" });
   await assert.rejects(instance.waitForPlaybackStart(), /network error/);
+  instance.kill();
+});
+
+test("an interrupted startup cannot remain marked as successfully playing", async () => {
+  const { instance, socket } = engine();
+  instance.prepareForPlayback();
+  socket.reply({ event: "start-file" });
+  socket.reply({ event: "file-loaded" });
+  socket.reply({ event: "end-file", reason: "stop" });
+  assert.equal(instance.started, false);
+  await assert.rejects(instance.waitForPlaybackStart(), /stop/);
+  instance.kill();
+});
+
+test("trailing MPV properties cannot revive an attempt that has already ended", async () => {
+  const { instance, socket } = engine();
+  instance.prepareForPlayback();
+  socket.reply({ event: "start-file" });
+  socket.reply({ event: "file-loaded" });
+  socket.reply({ event: "end-file", reason: "error", error: "HTTP 403" });
+  socket.reply({ event: "property-change", name: "time-pos", data: 0 });
+  socket.reply({ event: "playback-restart" });
+  assert.equal(instance.started, false);
+  await assert.rejects(instance.waitForPlaybackStart(), /HTTP 403/);
+  instance.kill();
+});
+
+test("MPV stream failures retain a safe cause once per load", () => {
+  const { instance, proc, socket } = engine();
+  const failures = () => diagnostics.events().filter((event) => event.code === "MPV_STREAM_FAILED");
+  const initial = failures().length;
+  instance.prepareForPlayback();
+  // Real libavformat errors contain signed URLs. They must neither be silently
+  // discarded by the console filter nor make it into the persistent details.
+  proc.stderr.write("[libavformat] HTTP 403 Forbidden https://media.invalid/audio?secret=token\n");
+  socket.reply({ event: "start-file" });
+  socket.reply({ event: "end-file", reason: "error", error: "HTTP 403 https://media.invalid/audio?secret=token" });
+  assert.equal(failures().length, initial + 1);
+  assert.deepEqual(failures()[0].details, { status: 403, reason: "forbidden" });
+  assert.equal(JSON.stringify(failures()[0]).includes("secret"), false);
+  instance.prepareForPlayback();
+  socket.reply({ event: "start-file" });
+  socket.reply({ event: "end-file", reason: "error", error: "network error" });
+  assert.equal(failures().length, initial + 2, "a new load can report its own failure");
   instance.kill();
 });
