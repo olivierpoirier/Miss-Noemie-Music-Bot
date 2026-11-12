@@ -161,6 +161,41 @@ if (url.includes("barrier1234")) {
     assert.equal(player.getPlayerDiagnostics().retryCount, 1);
   });
 
+  for (const profile of ["balanced", "xbox"] as const) {
+    await t.test(`MPV refusal with cookies reaches MP4 within one retry for ${profile}`, async () => {
+      const previousCookies = {
+        hasCookies: config.YTDLP_CONFIG.hasCookies,
+        cookiesPath: config.YTDLP_CONFIG.cookiesPath,
+      };
+      const previousProfile = shared.state.control.audioProfile;
+      try {
+        await reset();
+        config.YTDLP_CONFIG.hasCookies = true;
+        config.YTDLP_CONFIG.cookiesPath = path.join(directory, "cookies.txt");
+        fs.writeFileSync(config.YTDLP_CONFIG.cookiesPath, "# Netscape HTTP Cookie File\n");
+        shared.state.control.audioProfile = profile;
+        const current = track(`https://www.youtube.com/watch?v=alternate01&profile=${profile}`);
+        shared.state.queue = [current];
+        await player.ensurePlayerLoop(notify);
+
+        assert.equal(shared.playing?.item, current);
+        const extractions = entries().filter((entry) => entry.kind === "extract");
+        const loads = entries().filter((entry) => entry.kind === "load");
+        assert.equal(extractions.length, 2);
+        assert.equal(loads.length, 2);
+        assert.ok(extractions[0].args.includes("--cookies"));
+        assert.equal(extractions[0].args[extractions[0].args.indexOf("-f") + 1], "bestaudio");
+        assert.equal(extractions[1].args[extractions[1].args.indexOf("-f") + 1], config.YTDLP_CONFIG.youtubeMpvSafeFormat);
+        assert.match(loads[0].url, /primary-fails/);
+        assert.match(loads[1].url, /success/);
+        assert.equal(player.getPlayerDiagnostics().retryCount, 1);
+      } finally {
+        Object.assign(config.YTDLP_CONFIG, previousCookies);
+        shared.state.control.audioProfile = previousProfile;
+      }
+    });
+  }
+
   await t.test("an obsolete Spotify match is rematched with duration and retained through history", async () => {
     await reset();
     const originalUrl = "provider:spotify:Artist Track official audio";

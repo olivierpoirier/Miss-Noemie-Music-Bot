@@ -15,6 +15,7 @@
     "lint": "npm --prefix frontend run lint",
     "build": "npm run build:backend && npm run build:frontend",
     "doctor": "npm --prefix backend run doctor",
+    "check:stereo": "npm --prefix backend run check:stereo --",
     "update:ytdlp": "npm --prefix backend run update:ytdlp",
     "build:backend": "npm --prefix backend run build",
     "build:frontend": "npm --prefix frontend run build",

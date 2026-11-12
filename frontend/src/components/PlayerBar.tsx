@@ -500,7 +500,10 @@ export default function PlayerBar({
                                 } ${rainbow ? "rainbow-cycle" : ""}`}
                                 aria-label="Profil audio"
                                 type="button"
-                                title="Optimise le son pour le chemin micro / Xbox party"
+                                title={xboxProfileOn
+                                  ? "Xbox : mono et compression pour le chat vocal. Cliquer pour retrouver la stéréo fidèle."
+                                  : "Équilibré : stéréo fidèle, recommandé pour la musique. Cliquer pour le mode Xbox / chat vocal."
+                                }
                               >
                                 <span className="inline-flex items-center gap-2">
                                   <Headphones size={16} />

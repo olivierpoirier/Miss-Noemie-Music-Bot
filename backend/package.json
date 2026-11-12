@@ -7,6 +7,7 @@
     "start": "node dist/server.js",
     "test": "node --import tsx --test test/*.test.ts",
     "doctor": "node --import tsx src/doctor.ts",
+    "check:stereo": "node --import tsx src/stereoCheck.ts",
     "update:ytdlp": "node --import tsx src/doctor.ts --update-ytdlp",
     "build": "tsc -p tsconfig.json",
     "logs": "node --import tsx src/logs.ts"

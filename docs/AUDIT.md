@@ -110,3 +110,51 @@ Ces tests ne prouvent pas une cause unique pour les interruptions observées tou
 Validation de cette vérification : **136 tests réussis** (112 backend, 24 frontend), aucun échec ni test ignoré. Compilation backend, builds local/Vercel et lint réussis. Les tests d'erreur fatale utilisent de vrais processus Node isolés; les tests audio, fournisseurs et tunnel utilisent des services simulés sans identifiants privés. Les exécutables installés ont été vérifiés sans lecture audio : yt-dlp `2026.08.19`, mpv `0.37.0`.
 
 Chrome a également validé les nouveaux événements de mémoire et de session, leur affichage mobile sans débordement, l'accès malgré une panne audio simulée, l'arrêt des consultations à la fermeture du panneau et l'absence d'erreurs JavaScript non traitées.
+
+## Qualité audio — 11 novembre 2026
+
+Le profil Équilibré conserve la stéréo et les échantillons sous son plafond, avec une marge d'environ 1 dB avant le volume de sortie. Les deux profils désactivent le gain automatique du limiteur et compensent son tampon en fin de piste. Le profil Xbox conserve volontairement son traitement mono pour le chat vocal. Les nouveaux sinks Linux utilisent le flottant 32 bits à 48 kHz; les routes existantes sont conservées. La configuration personnelle de mpv est ignorée et l'ancien argument `--volume=30`, toujours remplacé au lancement, a été supprimé.
+
+YouTube privilégie les flux audio seuls avec le classement natif de yt-dlp, sans préférence imposée pour WebM. L'accès public est essayé après les cookies avant le secours MP4. Si mpv refuse un flux extrait, l'unique reprise change de stratégie pour atteindre le secours compatible; deux tests couvrent ce cas avec cookies, pour Équilibré et Xbox.
+
+Validation : **145 tests réussis** (121 backend, 24 frontend), aucun échec ni test ignoré. Les trois nouveaux tests de signal utilisent mpv **0.37.0** et des fichiers temporaires, sans périphérique sonore ni réseau. Ils vérifient les canaux, le gain sous le plafond, les pics surchargés, les derniers échantillons et la sortie mono Xbox. La compilation et le lint ont également réussi. Les tests utilisant sockets et processus enfants ont été exécutés hors du bac à sable, qui refusait ces opérations locales.
+
+Aucune écoute dans un véritable salon Discord/Xbox n'a été effectuée. Le routage système et le réencodage du chat vocal restent à vérifier depuis un appareil récepteur. Le [guide audio](AUDIO_QUALITY.md) précise les réglages et distingue les pics d'échantillons des pics reconstruits après encodage.
+
+La vérification des dépendances a conduit à deux correctifs compatibles, sans migration majeure : `body-parser` **1.20.8 → 1.20.9** côté backend et `postcss-selector-parser` **6.1.4 → 6.1.6** côté frontend. L'audit frontend autorisé a signalé uniquement des alertes modérées dans l'outillage de développement. L'alerte sur `minimatch` **10.2.6**, propagée par TypeScript ESLint, reste à traiter lors d'une mise à jour dédiée; le retour de version proposé par npm sort de la plage déclarée et n'a pas été appliqué.
+
+L'audit frontend a d'abord été refusé automatiquement, puis effectué après accord explicite. Une nouvelle requête d'audit backend a été refusée automatiquement parce que cet accord portait sur le frontend. Le correctif backend a été vérifié localement dans le verrou de dépendances, le package installé et les tests serveur; aucun nouvel audit réseau backend n'a été effectué après ce correctif.
+
+### Vérification réelle de l'entrée Discord
+
+Une entrée Linux explicite **Music-Bot-Stereo** (`xmbot_input`) reprend désormais les canaux gauche/droite du monitor, en flottant 32 bits à 48 kHz, sans remix. Elle est recréée au démarrage si nécessaire et réutilisée sans changer les réglages d'une entrée existante. Le monitor reste utilisable si le module de remappage n'est pas disponible. Le sink et son monitor restent obligatoires avant toute lecture.
+
+Sur la machine testée, Discord utilisait le monitor système par défaut en mono et envoyait sa propre sortie dans le sink qu'il capturait. L'entrée a été réglée explicitement sur Music-Bot-Stereo, avec le profil **Studio**; la sortie a été redirigée vers le périphérique physique, en conservant son état muet. La capture Discord est alors passée de **1 canal à 2 canaux, 48 kHz**. Les gains de l'entrée et du sink restent à 0 dB.
+
+Le morceau YouTube fourni a été lu par le bot en mode Équilibré. Un enregistrement numérique de **20,015 secondes**, pris uniquement sur l'entrée virtuelle, contient deux canaux distincts : corrélation 0,925 et différence gauche/droite non nulle. Aucun échantillon saturé; pic échantillon et crête reconstruite mesurés autour de **−14,9 dBFS** sur cet extrait. Cette mesure décrit l'entrée locale de Discord, pas le flux reçu après son encodage.
+
+Un second test a envoyé trois bips à gauche puis trois à droite, en interrompant temporairement le morceau avant de le reprendre. La capture locale confirme environ 1,04 seconde de signal exclusivement à gauche puis 1,05 seconde exclusivement à droite. L'utilisateur a confirmé recevoir les séries graves et aiguës sur l'autre appareil, sans confirmer leur position gauche/droite. La séparation stéréo à la réception reste donc à valider au casque; aucun enregistrement distant n'a été obtenu.
+
+Un test complémentaire a utilisé quatre bips identiques à 440 Hz dans chaque canal, avec une pause entre les séries. La capture locale confirme 2,78 secondes de signal exclusivement à gauche, puis 2,78 secondes exclusivement à droite. Sur Xbox via Discord, l'utilisateur a entendu les deux séries dans le seul écouteur gauche et a confirmé que le réglage mono de la console était déjà désactivé. La réception vocale testée mélange donc les canaux; la capture Discord à deux canaux ne constitue pas une preuve d'émission ou de restitution stéréo.
+
+Un essai séparé a ouvert une fenêtre mpv sans vidéo et partagé uniquement cette application via Go Live. Le client a créé un flux `discord_capture` à deux canaux, raccordé au flux mpv actif. La voie micro du compte a été coupée temporairement pour isoler ce nouveau trajet. Les premiers essais de bips dans ce partage ont été invalidés : mpv acceptait la commande IPC puis désactivait le filtre de diagnostic faute de disposition des canaux en sortie. La musique d'origine continuait alors à jouer. Aucun résultat de séparation stéréo ne peut être déduit de ces essais.
+
+Validation après cet ajout : **147 tests réussis** (123 backend, 24 frontend), aucun test ignoré ni échec, compilation backend réussie et `git diff --check` propre. Les nouveaux tests couvrent la création unique de l'alias, ses deux canaux sans remix, le gain initial, sa réutilisation et le repli vers le monitor.
+
+### Diagnostic complémentaire — 12 novembre 2026
+
+Le filtre du test a été corrigé avec une disposition de sortie explicite `aformat=channel_layouts=stereo`. Le nouvel outil `npm run check:stereo` est conservé dans le projet : aide sans action par défaut, contrôle du PID et du routage, ouverture facultative de la fenêtre, puis émission des bips uniquement avec `--play`. Il surveille les erreurs et désactivations de filtre et restaure les réglages musicaux d'origine. Les tests hors ligne utilisent le vrai mpv et des entrées à 44,1/48 kHz pour vérifier les quatre bips isolés de chaque côté et les silences.
+
+Dans la nouvelle session, les routes virtuelles ont été recréées et Discord a été replacé sur Music-Bot-Stereo avec le profil Studio. Le backend et le morceau fourni ont été relancés. Le signal du lecteur partagé a été enregistré isolément pendant 4,096 secondes : pic −14,58 dBFS, niveau RMS −27,36 dBFS, aucun échantillon saturé. L'option de partage du son était activée dans Discord.
+
+À ce stade du diagnostic, l'utilisateur a confirmé qu'un ami entendait la musique du stream mais que les streams restaient muets sur sa Xbox. L'essai de partage a été arrêté, la voie vocale du bot réactivée et les filtres musicaux conservés en attendant la vérification de la console. Aucun problème général de codec Xbox n'a été déduit de ce constat.
+
+Validation finale : **154 tests réussis** (130 backend, 24 frontend), aucun échec ni test ignoré, compilation backend et `git diff --check` réussis. Le contrôle sans lecture a identifié le lecteur actif et sa route réelle; le morceau reste lu en Opus stéréo, 48 kHz, avec le profil Équilibré et une capture Discord à deux canaux. Le partage temporaire et sa fenêtre ont été fermés. Aucun nouveau test audible n'a été envoyé pendant la reprise du 12 novembre.
+
+### Réception stéréo Xbox confirmée — 12 novembre 2026
+
+Après la mise à jour et le redémarrage de sa Xbox, l'utilisateur a confirmé entendre la musique du nouveau partage de l'application Music Bot. La voie micro du compte émetteur a été coupée pour isoler Go Live. Les métadonnées PipeWire ont confirmé deux liens directs distincts gauche/droite du lecteur mpv vers la capture du partage, sans microphone physique ni voix reçues dans ce flux.
+
+Le test corrigé a cette fois été contrôlé sur le lecteur réellement partagé et enregistré simultanément par son index Pulse. Les deux passages ont produit environ **2,786 secondes de signal exclusivement à gauche puis 2,786 secondes exclusivement à droite**. L'utilisateur a confirmé n'entendre que les quatre premiers bips dans le seul écouteur gauche, puis a validé l'essai de l'écouteur droit. Le trajet stéréo de bout en bout est donc confirmé pour **Go Live vers cette Xbox**. Les filtres musicaux d'origine ont été restaurés après chaque essai, et le partage est laissé actif avec la musique.
+
+L'outil prépare maintenant le titre de la fenêtre après sa création effective, afin de conserver sa visibilité dans le sélecteur Discord lorsqu'une fenêtre audio a déjà été fermée. Validation de cette correction : **155 tests réussis** (131 backend, 24 frontend), aucun échec ni test ignoré, compilation backend et `git diff --check` réussis. La réception vocale mono constatée précédemment reste un trajet distinct de la diffusion Go Live validée.

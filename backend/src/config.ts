@@ -137,6 +137,7 @@ export const AUDIO_CONFIG = {
   // Linux : création automatique d'un sink/source virtuel
   linuxEnableVirtualSink: envEnabled("LINUX_ENABLE_VIRTUAL_SINK", true),
   linuxVirtualSinkName: envOrDefault("LINUX_VIRTUAL_SINK_NAME", "xmbot_sink"),
+  linuxVirtualSourceName: envOrDefault("LINUX_VIRTUAL_SOURCE_NAME", "xmbot_input"),
   linuxVirtualSinkDescription: envOrDefault(
     "LINUX_VIRTUAL_SINK_DESCRIPTION",
     "XM-Bot-Virtual-Sink"
@@ -150,6 +151,8 @@ export const MPV_CONFIG = {
   ),
 
   baseArgs: [
+    // Keep personal mpv profiles, replay gain and filters out of the bot's mix.
+    "--no-config",
     "--video=no",
     "--input-terminal=no",
     "--term-osd=no",
@@ -167,7 +170,6 @@ export const MPV_CONFIG = {
     "--ad-lavc-ac3drc=0",
     "--gapless-audio=yes",
     "--audio-pitch-correction=yes",
-    "--volume=30",
     "--volume-max=100",
 
     // Robustesse

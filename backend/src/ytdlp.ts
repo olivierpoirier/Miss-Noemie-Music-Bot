@@ -1171,8 +1171,10 @@ export type PlayableSourceOptions = {
   skipDebugLabels?: string[];
 };
 
-const YOUTUBE_AUDIO_FIRST_FORMAT =
-  "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best";
+// Let yt-dlp compare source quality across codecs/containers. A forced WebM
+// preference can hide a higher-quality AAC source. Keep this audio-only so a
+// combined video fallback cannot beat the next audio-only extraction attempt.
+const YOUTUBE_AUDIO_FIRST_FORMAT = "bestaudio";
 
 const YOUTUBE_BALANCED_QUALITY_FORMAT =
   "best[ext=mp4][height<=720]/best[ext=mp4][height<=480]/18/bestaudio/best";
@@ -1252,16 +1254,16 @@ function getPlaybackExtractionAttempts(
     profile === "xbox"
       ? [
           bestAudioAttempts[0],
+          bestAudioAttempts[1],
           safeAttempts[0],
           safeAttempts[1],
-          bestAudioAttempts[1],
         ]
       : [
           bestAudioAttempts[0],
+          bestAudioAttempts[1],
           safeAttempts[0],
           qualityAttempts[0],
           qualityAttempts[1],
-          bestAudioAttempts[1],
           safeAttempts[1],
         ];
 

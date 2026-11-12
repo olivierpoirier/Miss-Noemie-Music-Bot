@@ -22,6 +22,13 @@ beforeEach(() => {
     fs.appendFileSync(logPath, JSON.stringify(args) + '\\n');
     const run = fs.readFileSync(logPath, 'utf8').trim().split('\\n').length;
     const target = new URL(args.at(-1));
+    const format = args[args.indexOf('-f') + 1];
+    const withCookies = args.includes('--cookies') || args.includes('--cookies-from-browser');
+    if ((target.searchParams.has('cookies-fail') && withCookies)
+      || (target.searchParams.has('audio-fails') && format === 'bestaudio')) {
+      fs.writeSync(2, 'HTTP Error 403: unavailable source');
+      process.exit(1);
+    }
     if (target.searchParams.has('fail')) {
       fs.writeSync(2, 'HTTP Error 403: https://private.invalid/audio?token=private-secret');
       process.exit(1);
@@ -134,6 +141,43 @@ test("missing cookies do not duplicate YouTube extraction attempts and custom cl
   assert.equal(attempts.length, 3);
   assert.equal(attempts[0][attempts[0].indexOf("--extractor-args") + 1], "youtube:player_client=configured-client");
   assert.equal(attempts[1][attempts[1].indexOf("--extractor-args") + 1], "youtube:player_client=android");
+});
+
+test("YouTube uses audio-only quality selection across containers for both profiles", async () => {
+  const { getPlayableSource } = await freshResolver();
+  for (const profile of ["balanced", "xbox"] as const) {
+    assert.ok(await getPlayableSource("https://www.youtube.com/watch?v=offline1234", profile));
+  }
+  assert.equal(calls().length, 2);
+  for (const attempt of calls()) {
+    assert.equal(attempt[attempt.indexOf("-f") + 1], "bestaudio");
+  }
+});
+
+test("rejected YouTube cookies try public audio before a combined video fallback", async () => {
+  YTDLP_CONFIG.hasCookies = true;
+  YTDLP_CONFIG.cookiesPath = path.join(directory, "cookies.txt");
+  const { getPlayableSource } = await freshResolver();
+  for (const profile of ["balanced", "xbox"] as const) {
+    const source = await getPlayableSource("https://www.youtube.com/watch?v=offline1234&cookies-fail=1", profile);
+    assert.equal(source?.debugLabel, "youtube-bestaudio-public");
+  }
+  const attempts = calls();
+  assert.equal(attempts.length, 4);
+  for (let index = 0; index < attempts.length; index++) {
+    assert.equal(attempts[index][attempts[index].indexOf("-f") + 1], "bestaudio");
+    assert.equal(attempts[index].includes("--cookies"), index % 2 === 0);
+  }
+});
+
+test("unavailable YouTube audio retains the compatible MP4 fallback", async () => {
+  const { getPlayableSource } = await freshResolver();
+  const source = await getPlayableSource("https://www.youtube.com/watch?v=offline1234&audio-fails=1");
+  assert.match(source?.debugLabel || "", /^youtube-mpv-safe-/);
+  const attempts = calls();
+  assert.equal(attempts.length, 2);
+  assert.equal(attempts[0][attempts[0].indexOf("-f") + 1], "bestaudio");
+  assert.equal(attempts[1][attempts[1].indexOf("-f") + 1], YTDLP_CONFIG.youtubeMpvSafeFormat);
 });
 
 test("a hung extractor is killed and source resolution releases within its total deadline", async () => {

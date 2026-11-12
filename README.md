@@ -134,6 +134,8 @@ Le mode local complet a besoin de:
 
 Le backend vérifie le routage au démarrage. Si l'entrée virtuelle n'est pas prête, l'interface affiche une alerte et la lecture est bloquée pour éviter une sortie audio système.
 
+Pour la meilleure fidélité musicale, utilise le profil **Équilibré**. Le [guide de qualité audio](docs/AUDIO_QUALITY.md) explique les réglages Discord, VoiceMeeter et Linux, ainsi que les limites du trajet par chat vocal.
+
 ## Commandes utiles
 
 ```bash
@@ -143,6 +145,7 @@ npm run build:frontend:vercel
 npm test
 npm run lint
 npm run doctor
+npm run check:stereo
 npm run update:ytdlp
 ```
 
@@ -208,6 +211,7 @@ Cette séparation est importante: le mode local doit continuer à servir `fronte
 | `SPOTIFY_MARKET` | Marché Spotify sur deux lettres, `FR` par défaut. Utilise `CA` pour le catalogue canadien. |
 | `LINUX_ENABLE_VIRTUAL_SINK` | Crée le sink virtuel automatiquement par défaut. Avec `false`, un sink existant portant le nom configuré reste utilisable. |
 | `LINUX_VIRTUAL_SINK_NAME` | Nom du sink Linux, `xmbot_sink` par défaut; sa source `.monitor` doit être présente. |
+| `LINUX_VIRTUAL_SOURCE_NAME` | Entrée Linux nommée Music-Bot-Stereo, `xmbot_input` par défaut; reprend les deux canaux du sink pour les applications qui masquent les monitors. |
 | `DIAGNOSTICS_ENABLED` | Journal persistant activé par défaut; `false` conserve uniquement les événements en mémoire. |
 | `DIAGNOSTICS_LOG_DIR` | Dossier du journal, `.data/logs` à la racine du projet par défaut. |
 | `DIAGNOSTICS_HEARTBEAT_MS` | Intervalle des relevés de mémoire et de réactivité, 5 minutes par défaut; entre 30 secondes et une heure. |

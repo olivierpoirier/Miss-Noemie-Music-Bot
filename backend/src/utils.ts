@@ -241,8 +241,11 @@ function createLinuxNullSink(
     "module-null-sink",
     `sink_name=${sinkName}`,
     `sink_properties=device.description=${description}`,
+    // Keep the virtual route in floating point, like MPV's decoded output.
+    "format=float32le",
     "rate=48000",
     "channels=2",
+    "channel_map=front-left,front-right",
   ]);
 
   if (!result.ok) {
@@ -261,6 +264,33 @@ function createLinuxNullSink(
   );
 
   return true;
+}
+
+function ensureLinuxStereoInput(monitorSource: string): string | null {
+  const sourceName = AUDIO_CONFIG.linuxVirtualSourceName;
+  // Reuse a manually configured input without replacing it or changing gain.
+  if (findSourceByName(sourceName)) return sourceName;
+
+  const result = runCommand("pactl", [
+    "load-module",
+    "module-remap-source",
+    `source_name=${sourceName}`,
+    "source_properties=device.description=Music-Bot-Stereo",
+    `master=${monitorSource}`,
+    "format=float32le",
+    "rate=48000",
+    "channels=2",
+    "master_channel_map=front-left,front-right",
+    "channel_map=front-left,front-right",
+    "remix=no",
+  ]);
+  if (!result.ok || !findSourceByName(sourceName)) return null;
+
+  // Only initialize the input created here; keep existing mixer settings.
+  if (!runCommand("pactl", ["set-source-volume", sourceName, "0dB"]).ok) {
+    console.warn(`[audio] Le gain de la nouvelle entrée ${sourceName} n'a pas pu être initialisé à 0 dB.`);
+  }
+  return sourceName;
 }
 
 async function ensureLinuxAudioReady(): Promise<boolean> {
@@ -325,12 +355,19 @@ async function ensureLinuxAudioReady(): Promise<boolean> {
     return false;
   }
 
+  // Expose an ordinary named input for clients that hide monitor sources.
+  // This preserves two source channels; the client still chooses its capture
+  // and encoding format. The monitor remains a compatible fallback.
+  const stereoInput = ensureLinuxStereoInput(monitorSource);
+  const inputSource = stereoInput || monitorSource;
   setRuntimeAudioRouting({
     audioDevice: `pulse/${sinkName}`,
     virtualSinkName: sinkName,
-    virtualMonitorSource: monitorSource,
+    virtualMonitorSource: inputSource,
     degraded: false,
-    message: `Audio virtuel Linux prêt. Sink="${sinkName}" | Source d'entrée="${monitorSource}"`,
+    message: stereoInput
+      ? `Audio virtuel Linux prêt. Sink="${sinkName}" | Source d'entrée="${inputSource}" (Music-Bot-Stereo)`
+      : `Audio virtuel Linux prêt. Sink="${sinkName}" | Source d'entrée="${monitorSource}". L'entrée nommée est indisponible : si le client masque le monitor, définis cette source comme entrée par défaut puis sélectionne « Par défaut ».`,
   });
 
   return true;
