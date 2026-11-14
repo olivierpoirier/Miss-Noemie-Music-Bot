@@ -156,3 +156,17 @@ test('runtime and provider context survives export while arbitrary strings are e
   body.recentEvents[0].runId = 'private-secret';
   assert.equal(JSON.stringify(parseDiagnostics(body)).includes('private-secret'), false);
 });
+
+test('YouTube restriction reasons survive diagnostic rendering and export without private provider data', async () => {
+  const { parseDiagnostics } = await diagnosticsModule;
+  for (const reason of ['age_restricted', 'login_required', 'bot_check', 'cookies_invalid', 'format_unavailable', 'client_unavailable']) {
+    const body = snapshot();
+    body.recentEvents[0].details = {
+      platform: 'youtube', stage: 'extraction', reason,
+      stderr: 'private-stderr', cookiesPath: '/private-cookies', url: 'https://private.invalid/audio',
+    };
+    const parsed = parseDiagnostics(body);
+    assert.deepEqual(parsed.recentEvents[0].details, { platform: 'youtube', stage: 'extraction', reason });
+    assert.equal(JSON.stringify(parsed).includes('private'), false);
+  }
+});

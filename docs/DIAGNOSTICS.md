@@ -54,6 +54,8 @@ Les événements possèdent un horodatage, un code stable et, quand disponibles,
 ## Comprendre un arrêt
 
 - `MPV_STREAM_FAILED` avec HTTP 403 : le flux a été refusé, par exemple après expiration d'une URL ou d'une session. Le lecteur extrait une autre source avant de réessayer.
+- `YOUTUBE_AGE_RESTRICTED` : YouTube exige une connexion permettant de confirmer l'âge. Le bot ne filtre pas les mots vulgaires; certaines vidéos ont une restriction imposée par YouTube. Les cookies présents peuvent appartenir à une session expirée ou à un compte qui ne peut pas lire cette vidéo.
+- `YOUTUBE_LOGIN_REQUIRED`, `YOUTUBE_COOKIES_INVALID` ou `YOUTUBE_BOT_CHECK` : une connexion, un nouvel export de session ou une vérification dans le navigateur est nécessaire. Le diagnostic conserve ce motif même si les tentatives suivantes échouent pour un client ou un format indisponible.
 - `MEDIA_RESOLUTION_FALLBACK` : une méthode a échoué, une autre est essayée. Ce message seul ne signifie pas que la piste est perdue; chercher la réussite ou l'échec qui suit.
 - `SPOTIFY_REQUEST_FAILED` avec 429 : Spotify impose un quota. Le bot respecte le délai, y compris entre plusieurs ajouts; réessayer immédiatement ne provoque plus de nouvelles requêtes au service.
 - `PLAYBACK_RETRY`, puis `PLAYBACK_RECOVERED` : la reprise a tenu au moins 30 secondes de progression réelle. Deux échecs rapprochés restent limités; une session longue récupérée retrouve ensuite une tentative de secours.
@@ -63,6 +65,16 @@ Les événements possèdent un horodatage, un code stable et, quand disponibles,
 `RUNTIME_HEARTBEAT` est écrit au démarrage puis toutes les cinq minutes : durée d'activité, mémoire totale, mémoire JavaScript et retard du timer. `DIAGNOSTICS_HEARTBEAT_MS` ajuste cet intervalle entre 30 secondes et une heure. Le retard indique un manque de réactivité ou une suspension de la machine; il ne distingue pas à lui seul ces causes. Aucun log n'est produit à chaque mise à jour de progression audio.
 
 Une panne du tunnel Cloudflare ne ferme plus l'application locale : le lanceur le relance avec un délai progressif de une à trente secondes. Ses sorties restent dans la console du lanceur. Une coupure du navigateur conserve les ajouts non confirmés jusqu'à leur confirmation ou leur expiration afin de limiter les doublons.
+
+### Rétablir l'accès aux vidéos YouTube avec restriction d'âge
+
+Vérifie d'abord que le compte connecté dans le navigateur peut lire la vidéo. Exporte ensuite ses cookies YouTube au format Netscape vers `backend/cookies.txt`, ou configure `YTDLP_COOKIES_PATH` dans `backend/.env` pour utiliser un autre fichier. Le fichier `www.youtube.com_cookies.txt` n'est pas choisi automatiquement. Relance le bot après modification.
+
+Autre possibilité : configure `YTDLP_COOKIES_FROM_BROWSER=firefox` (ou ton navigateur compatible) dans `backend/.env`. Le fichier cookies a priorité : retire sa configuration et déplace `backend/cookies.txt` si tu veux utiliser la session du navigateur. Un export périmé ne devient pas valide en changeant de format audio ou de client.
+
+YouTube renouvelle régulièrement les cookies des onglets ouverts. Le [guide officiel yt-dlp](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies) décrit comment exporter une session qui reste utilisable. Ne joins jamais ce fichier au diagnostic.
+
+Le bot essaie d'abord l'audio seul, puis un flux combiné avec des clients compatibles avec les cookies pour les deux profils audio. Node est activé par défaut pour les vérifications JavaScript de yt-dlp; `YTDLP_JS_RUNTIME` permet de choisir un autre moteur. Ces replis ne remplacent pas l'autorisation du compte exigée par YouTube.
 
 ## Conservation
 

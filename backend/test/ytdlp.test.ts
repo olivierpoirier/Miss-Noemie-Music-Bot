@@ -24,6 +24,33 @@ beforeEach(() => {
     const target = new URL(args.at(-1));
     const format = args[args.indexOf('-f') + 1];
     const withCookies = args.includes('--cookies') || args.includes('--cookies-from-browser');
+    if (target.searchParams.has('authenticated-combined') || target.searchParams.has('authenticated-audio')) {
+      const failure = !withCookies ? 'Sign in to confirm your age.'
+        : args.includes('--extractor-args') ? 'The following content is not available on this app.'
+        : format === 'bestaudio' && target.searchParams.has('authenticated-combined') ? 'Requested format is not available.' : null;
+      if (failure) {
+        fs.writeSync(2, 'ERROR: [youtube] ' + failure);
+        process.exit(1);
+      }
+    }
+    if (target.searchParams.has('authenticated-format-fails')) {
+      fs.writeSync(2, 'ERROR: [youtube] ' + (withCookies
+        ? 'Requested format is not available.' : 'Sign in to confirm your age.'));
+      process.exit(1);
+    }
+    if (target.searchParams.has('access-denied')) {
+      const reason = target.searchParams.get('access-denied');
+      const failures = {
+        age_restricted: 'Sign in to confirm your age.',
+        login_required: 'Login required.',
+        bot_check: "Sign in to confirm you're not a bot.",
+        cookies_invalid: 'The cookies provided are no longer valid.'
+      };
+      fs.writeSync(2, 'ERROR: [youtube] ' + (format === 'bestaudio'
+        ? failures[reason] : 'The following content is not available on this app.')
+        + ' https://private.invalid/stream?token=private-secret');
+      process.exit(1);
+    }
     if ((target.searchParams.has('cookies-fail') && withCookies)
       || (target.searchParams.has('audio-fails') && format === 'bestaudio')) {
       fs.writeSync(2, 'HTTP Error 403: unavailable source');
@@ -178,6 +205,80 @@ test("unavailable YouTube audio retains the compatible MP4 fallback", async () =
   assert.equal(attempts.length, 2);
   assert.equal(attempts[0][attempts[0].indexOf("-f") + 1], "bestaudio");
   assert.equal(attempts[1][attempts[1].indexOf("-f") + 1], YTDLP_CONFIG.youtubeMpvSafeFormat);
+});
+
+test("authenticated YouTube combined streams use cookie-compatible automatic clients for both profiles", async () => {
+  YTDLP_CONFIG.youtubePlayerClients = "android";
+  const { getPlayableSource } = await freshResolver();
+  for (const profile of ["balanced", "xbox"] as const) {
+    for (const cookieSource of ["file", "browser"] as const) {
+      YTDLP_CONFIG.hasCookies = cookieSource === "file";
+      YTDLP_CONFIG.cookiesPath = cookieSource === "file" ? path.join(directory, "cookies.txt") : null;
+      YTDLP_CONFIG.cookiesFromBrowser = cookieSource === "browser" ? "firefox" : "";
+      const before = calls().length;
+      const source = await getPlayableSource(`https://www.youtube.com/watch?v=offline1234&authenticated-combined=1&cookies=${cookieSource}`, profile);
+      assert.equal(source?.debugLabel, "youtube-mpv-safe-authenticated-cookies");
+      const attempts = calls().slice(before);
+      assert.equal(attempts.length, 4);
+      assert.equal(attempts[0][attempts[0].indexOf("--extractor-args") + 1], "youtube:player_client=android");
+      assert.equal(attempts[1][attempts[1].indexOf("-f") + 1], "bestaudio");
+      assert.ok(!attempts[1].includes("--extractor-args"));
+      assert.ok(attempts[3].includes(cookieSource === "file" ? "--cookies" : "--cookies-from-browser"));
+      assert.ok(!attempts[3].includes("--extractor-args"));
+      assert.equal(attempts[3][attempts[3].indexOf("-f") + 1], YTDLP_CONFIG.youtubeMpvSafeFormat);
+    }
+  }
+});
+
+test("authenticated automatic clients retain audio-only quality before combined YouTube fallback", async () => {
+  YTDLP_CONFIG.youtubePlayerClients = "android";
+  YTDLP_CONFIG.hasCookies = true;
+  YTDLP_CONFIG.cookiesPath = path.join(directory, "cookies.txt");
+  const { getPlayableSource } = await freshResolver();
+  for (const profile of ["balanced", "xbox"] as const) {
+    const before = calls().length;
+    const source = await getPlayableSource("https://www.youtube.com/watch?v=offline1234&authenticated-audio=1", profile);
+    assert.equal(source?.debugLabel, "youtube-bestaudio-authenticated-cookies");
+    const attempts = calls().slice(before);
+    assert.equal(attempts.length, 2);
+    assert.equal(attempts[1][attempts[1].indexOf("-f") + 1], "bestaudio");
+    assert.ok(attempts[1].includes("--cookies"));
+    assert.ok(!attempts[1].includes("--extractor-args"));
+  }
+});
+
+test("YouTube access refusals remain actionable after later client failures without leaking stderr", async (t) => {
+  const output: unknown[][] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => output.push(args));
+  const { getPlayableSource } = await freshResolver();
+  for (const [reason, code] of [
+    ["age_restricted", "YOUTUBE_AGE_RESTRICTED"],
+    ["login_required", "YOUTUBE_LOGIN_REQUIRED"],
+    ["bot_check", "YOUTUBE_BOT_CHECK"],
+    ["cookies_invalid", "YOUTUBE_COOKIES_INVALID"],
+  ]) {
+    assert.equal(await getPlayableSource(`https://www.youtube.com/watch?v=offline1234&access-denied=${reason}`), null);
+    const events = diagnostics.events();
+    const failure = events.find((event) => event.code === "MEDIA_RESOLUTION_FAILED");
+    assert.equal(failure?.details?.reason, reason);
+    assert.equal(failure?.details?.stage, "extraction");
+    assert.ok(events.some((event) => event.code === code && event.details?.reason === reason));
+  }
+  assert.equal(output.length, 4);
+  const observed = JSON.stringify({ output, events: diagnostics.events() });
+  assert.ok(!observed.includes("private-secret"));
+  assert.ok(!observed.includes("private.invalid"));
+});
+
+test("public age refusals do not hide format failures from an authenticated YouTube session", async () => {
+  YTDLP_CONFIG.hasCookies = true;
+  YTDLP_CONFIG.cookiesPath = path.join(directory, "cookies.txt");
+  const { getPlayableSource } = await freshResolver();
+  for (const profile of ["balanced", "xbox"] as const) {
+    assert.equal(await getPlayableSource("https://www.youtube.com/watch?v=offline1234&authenticated-format-fails=1", profile), null);
+    const failure = diagnostics.events().find((event) => event.code === "MEDIA_RESOLUTION_FAILED");
+    assert.equal(failure?.details?.reason, "format_unavailable");
+  }
 });
 
 test("a hung extractor is killed and source resolution releases within its total deadline", async () => {

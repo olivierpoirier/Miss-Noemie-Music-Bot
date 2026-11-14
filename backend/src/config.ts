@@ -115,7 +115,9 @@ if (HAS_COOKIES) {
   console.warn(`⚠️ Fichier cookies introuvable à : ${COOKIES_PATH}`);
 }
 
-const YTDLP_JS_RUNTIME = readEnv("YTDLP_JS_RUNTIME");
+// The backend already runs on a supported Node version. Enable that exact
+// executable for YouTube challenges instead of requiring another runtime on PATH.
+const YTDLP_JS_RUNTIME = envOrDefault("YTDLP_JS_RUNTIME", `node:${process.execPath}`);
 
 export const AUDIO_CONFIG = {
   windowsVoicemeeterPath: envOrDefault(
@@ -233,7 +235,8 @@ export const YTDLP_CONFIG = {
     "--no-progress",
     "--no-warnings",
     "--ignore-config",
-    ...(YTDLP_JS_RUNTIME ? ["--js-runtimes", YTDLP_JS_RUNTIME] : []),
+    "--js-runtimes",
+    YTDLP_JS_RUNTIME,
   ],
 
   cacheTTL: 600_000,

@@ -592,7 +592,7 @@ function sourceOptions(item: QueueItem): SourceOptions {
   // Cookie/public extraction can return the same audio URL rejected by MPV.
   // Use a different strategy within the player's single recovery attempt.
   const skipDebugLabels = label?.startsWith("youtube-bestaudio-")
-    ? ["youtube-bestaudio-cookies", "youtube-bestaudio-public"]
+    ? ["youtube-bestaudio-cookies", "youtube-bestaudio-authenticated-cookies", "youtube-bestaudio-public"]
     : label ? [label] : [];
   return { bypassCache: true, skipDebugLabels };
 }

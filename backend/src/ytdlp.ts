@@ -2,7 +2,7 @@ import { spawn } from "child_process";
 import play from "play-dl";
 import { performance } from "node:perf_hooks";
 import { recordBackendMetric } from "./metrics.js";
-import { recordDiagnostic, diagnosticErrorDetails } from "./diagnostics.js";
+import { recordDiagnostic, diagnosticErrorDetails, type DiagnosticDetails } from "./diagnostics.js";
 import { resolveSpotifyUrl } from "./spotify.js";
 
 import { MPV_CONFIG, YTDLP_CONFIG } from "./config.js";
@@ -1235,36 +1235,49 @@ function getPlaybackExtractionAttempts(
     },
   ];
 
-  const safeAttempts: PlaybackExtractionAttempt[] = [
-    {
-      label: `youtube-mpv-safe-${safeClient}-cookies`,
-      format: safeFormat,
+  // Age-restricted videos may only expose a combined stream after login.
+  // Let yt-dlp select cookie-compatible clients for this attempt: forcing
+  // Android here can discard authentication, even with valid account cookies.
+  const authenticatedSafeAttempt: PlaybackExtractionAttempt = {
+    label: "youtube-mpv-safe-authenticated-cookies",
+    format: safeFormat,
+    useCookies: true,
+    youtubePlayerClient: null,
+  };
+  const publicSafeAttempt: PlaybackExtractionAttempt = {
+    label: `youtube-mpv-safe-${safeClient}-public`,
+    format: safeFormat,
+    useCookies: false,
+    youtubePlayerClient: safeClient,
+  };
+  const hasCookies = Boolean(YTDLP_CONFIG.hasCookies || YTDLP_CONFIG.cookiesFromBrowser);
+  const safeAttempt = hasCookies
+    ? authenticatedSafeAttempt
+    : publicSafeAttempt;
+  const audioAttempts: PlaybackExtractionAttempt[] = [
+    bestAudioAttempts[0],
+    ...(hasCookies ? [{
+      label: "youtube-bestaudio-authenticated-cookies",
+      format: YOUTUBE_AUDIO_FIRST_FORMAT,
       useCookies: true,
-      youtubePlayerClient: safeClient,
-    },
-    {
-      label: `youtube-mpv-safe-${safeClient}-public`,
-      format: safeFormat,
-      useCookies: false,
-      youtubePlayerClient: safeClient,
-    },
+      youtubePlayerClient: null,
+    }] : []),
+    bestAudioAttempts[1],
   ];
 
   const attempts =
     profile === "xbox"
       ? [
-          bestAudioAttempts[0],
-          bestAudioAttempts[1],
-          safeAttempts[0],
-          safeAttempts[1],
+          ...audioAttempts,
+          safeAttempt,
+          publicSafeAttempt,
         ]
       : [
-          bestAudioAttempts[0],
-          bestAudioAttempts[1],
-          safeAttempts[0],
+          ...audioAttempts,
+          safeAttempt,
           qualityAttempts[0],
           qualityAttempts[1],
-          safeAttempts[1],
+          publicSafeAttempt,
         ];
 
   const seen = new Set<string>();
@@ -1346,6 +1359,21 @@ export async function getPlayableSource(
         ? YTDLP_CONFIG.soundCloudPlaybackTimeoutMs
         : YTDLP_CONFIG.processTimeoutMs
     );
+    let lastFailure: DiagnosticDetails = { reason: "unavailable" };
+    let authenticatedFailure: DiagnosticDetails | undefined;
+    const accessReasons = new Set(["age_restricted", "login_required", "bot_check", "cookies_invalid"]);
+    const rememberFailure = (details: DiagnosticDetails, attempt: PlaybackExtractionAttempt) => {
+      // A later unsupported-client/format error must not erase YouTube's
+      // actionable access refusal. Public age refusals do not establish that
+      // the configured account was rejected: prefer its own failure instead.
+      const authenticated = isYoutubeUrl(normalized) && attempt.useCookies &&
+        Boolean(YTDLP_CONFIG.hasCookies || YTDLP_CONFIG.cookiesFromBrowser);
+      const previous = authenticated ? authenticatedFailure : lastFailure;
+      if (accessReasons.has(previous?.reason || "")) return;
+      if (previous && details.reason === "unknown") return;
+      if (authenticated) authenticatedFailure = details;
+      else lastFailure = details;
+    };
 
     const tryOnce = async (
       attempt: PlaybackExtractionAttempt
@@ -1373,6 +1401,7 @@ export async function getPlayableSource(
           // A successful extraction can already contain an unusable signed
           // URL. Try the next extraction strategy before handing it to MPV.
           recordDiagnostic("YTDLP_PROCESS_FAILED", { platform: getMediaPlatform(normalized), reason: "unavailable" });
+          rememberFailure({ reason: "unavailable" }, attempt);
           return null;
         }
 
@@ -1383,11 +1412,14 @@ export async function getPlayableSource(
           }
         }
 
+        if (!source) rememberFailure({ reason: "unavailable" }, attempt);
         return source;
       } catch (err) {
         // Process errors are already classified by the runner. JSON/shape
         // errors must also remain visible without logging raw output.
-        recordDiagnostic("YTDLP_PROCESS_FAILED", { ...diagnosticErrorDetails(err), platform: getMediaPlatform(normalized) });
+        const details = diagnosticErrorDetails(err);
+        rememberFailure(details, attempt);
+        recordDiagnostic("YTDLP_PROCESS_FAILED", { ...details, platform: getMediaPlatform(normalized) });
         return null;
       }
     };
@@ -1402,7 +1434,21 @@ export async function getPlayableSource(
       if (source) return source;
     }
 
-    recordDiagnostic("MEDIA_RESOLUTION_FAILED", { platform: getMediaPlatform(normalized), stage: "extraction", reason: "unavailable" });
+    const failure = authenticatedFailure ?? lastFailure;
+    if (isYoutubeUrl(normalized)) {
+      const accessEvents = {
+        age_restricted: "YOUTUBE_AGE_RESTRICTED",
+        login_required: "YOUTUBE_LOGIN_REQUIRED",
+        bot_check: "YOUTUBE_BOT_CHECK",
+        cookies_invalid: "YOUTUBE_COOKIES_INVALID",
+      } as const;
+      const code = accessEvents[failure.reason as keyof typeof accessEvents];
+      if (code) {
+        recordDiagnostic(code, { ...failure, platform: "youtube", stage: "extraction" });
+        console.warn(`[ytdlp] YouTube : ${failure.reason}. Consulte « Diagnostic du bot » pour rétablir l’accès à cette vidéo.`);
+      }
+    }
+    recordDiagnostic("MEDIA_RESOLUTION_FAILED", { ...failure, platform: getMediaPlatform(normalized), stage: "extraction" });
     return null;
   })();
 

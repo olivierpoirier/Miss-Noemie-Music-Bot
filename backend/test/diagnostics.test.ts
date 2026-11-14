@@ -116,6 +116,66 @@ test("error classification retains useful categories without retaining messages"
   assert.deepEqual(diagnosticErrorDetails({ status: 429, message: "secret" }), { status: 429, reason: "rate_limit" });
 });
 
+test("YouTube restrictions are classified from terminal errors without retaining stderr", () => {
+  const cases = [
+    {
+      reason: "age_restricted",
+      stderr: "WARNING: [youtube] The provided YouTube account cookies are no longer valid. They have likely been rotated in the browser.\nERROR: [youtube] KVLXhne2I2E: Sign in to confirm your age. Use --cookies-from-browser or --cookies for the authentication.",
+    },
+    {
+      reason: "login_required",
+      stderr: "WARNING: [youtube] Some formats have been skipped\nERROR: [youtube] private1234: Private video. Sign in if you’ve been granted access to this video.",
+    },
+    {
+      reason: "bot_check",
+      stderr: "ERROR: [youtube] fixture1234: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication.",
+    },
+    {
+      reason: "cookies_invalid",
+      stderr: "WARNING: [youtube] The provided YouTube account cookies are no longer valid. They have likely been rotated in the browser.",
+    },
+    {
+      reason: "format_unavailable",
+      stderr: "WARNING: [youtube] This video is age-restricted; some formats may be missing without authentication.\nERROR: [youtube] fixture1234: Requested format is not available. Use --list-formats for a list of available formats.",
+    },
+    {
+      reason: "client_unavailable",
+      stderr: "ERROR: [youtube] fixture1234: The following content is not available on this app. Watch on the latest version of YouTube.",
+    },
+  ];
+  for (const { reason, stderr } of cases) {
+    const classified = diagnosticErrorDetails(new Error(stderr));
+    assert.deepEqual(classified, { reason });
+    assert.deepEqual(diagnosticErrorDetails({ code: reason, message: "private-stderr" }), { reason });
+  }
+  assert.deepEqual(diagnosticErrorDetails(new Error("WARNING: [youtube] This video is age-restricted; some formats may be missing.\nERROR: unable to download audio data: HTTP Error 403: Forbidden")), { status: 403, reason: "forbidden" });
+  assert.deepEqual(diagnosticErrorDetails(new Error("WARNING: [youtube] The provided cookies are no longer valid\nERROR: network unavailable")), { reason: "network" });
+  assert.deepEqual(diagnosticErrorDetails(new Error("WARNING: [youtube] This video is age-restricted\nERROR: Download timed out")), { reason: "timeout" });
+  assert.deepEqual(diagnosticErrorDetails(new Error("ERROR: [youtube] fixture1234: Unable to extract player response")), { reason: "unknown" });
+});
+
+test("YouTube restriction reasons and actionable events survive persistence without provider text", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "xmb-youtube-diagnostics-"));
+  try {
+    const store = createDiagnosticStore(options(directory));
+    for (const reason of ["age_restricted", "login_required", "bot_check", "cookies_invalid", "format_unavailable", "client_unavailable"]) {
+      store.record("YTDLP_PROCESS_FAILED", { reason });
+    }
+    for (const code of ["YOUTUBE_AGE_RESTRICTED", "YOUTUBE_LOGIN_REQUIRED", "YOUTUBE_BOT_CHECK", "YOUTUBE_COOKIES_INVALID"] as const) {
+      store.record(code, { platform: "youtube", stderr: "private-stderr", token: "private-token" } as any);
+    }
+    await store.flush();
+    const restored = createDiagnosticStore(options(directory));
+    await restored.initialize();
+    assert.deepEqual(restored.events(), store.events());
+    const serialized = JSON.stringify(restored.events());
+    assert.equal(serialized.includes("private-"), false);
+    for (const reason of ["age_restricted", "login_required", "bot_check", "cookies_invalid", "format_unavailable", "client_unavailable"]) {
+      assert.ok(restored.events().some((event) => event.details?.reason === reason));
+    }
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
 test("process exit codes remain distinct from HTTP statuses", async () => {
   const store = createDiagnosticStore({ ...options("unused"), enabled: false });
   store.record("MPV_EXITED", { exitCode: 7, status: 7 });

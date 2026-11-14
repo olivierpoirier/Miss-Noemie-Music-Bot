@@ -49,6 +49,10 @@ const EVENTS = {
   YTDLP_TIMEOUT: ["error", "ytdlp", "yt-dlp a dépassé son délai de résolution."],
   YTDLP_PROCESS_FAILED: ["warn", "ytdlp", "Une tentative d'extraction yt-dlp a échoué."],
   YTDLP_SOURCE_RESOLVED: ["info", "ytdlp", "Une source audio a été résolue par yt-dlp."],
+  YOUTUBE_AGE_RESTRICTED: ["error", "ytdlp", "YouTube exige une confirmation d'âge. Actualise les cookies d'un compte autorisé à regarder cette vidéo."],
+  YOUTUBE_LOGIN_REQUIRED: ["error", "ytdlp", "YouTube exige une connexion pour cette vidéo. Actualise les cookies d'une session YouTube qui peut la lire."],
+  YOUTUBE_BOT_CHECK: ["error", "ytdlp", "YouTube demande une vérification anti-bot. Ouvre la vidéo dans le navigateur, effectue la vérification puis réessaie."],
+  YOUTUBE_COOKIES_INVALID: ["error", "ytdlp", "Les cookies de session YouTube sont expirés ou invalides. Exporte une nouvelle session puis relance le bot."],
   TOOL_CHECK_OK: ["info", "tools", "Les exécutables audio ont été vérifiés."],
   TOOL_CHECK_WARNING: ["warn", "tools", "Un exécutable audio est absent, ancien ou impossible à vérifier."],
 } as const satisfies Record<string, readonly [Level, string, string]>;
@@ -58,6 +62,7 @@ export type DiagnosticEvent = Omit<SharedDiagnosticEvent, "code"> & { code: Diag
 
 const REASONS = new Set([
   "timeout", "network", "unauthorized", "forbidden", "rate_limit", "unavailable",
+  "age_restricted", "login_required", "bot_check", "cookies_invalid", "format_unavailable", "client_unavailable",
   "client_disconnect", "server_disconnect", "transport_close", "transport_error", "ping_timeout", "parse_error", "cancelled", "shutdown",
   "listener_limit", "deprecated", "uncaught_exception", "unhandled_rejection", "SIGINT", "SIGTERM", "idle", "startup_failed", "http_error",
   "ENOENT", "EACCES", "EPERM", "ECONNRESET", "ECONNREFUSED", "EPIPE", "ENOTFOUND", "EADDRINUSE", "unknown",
@@ -81,12 +86,22 @@ function safeDetails(input: DiagnosticDetails = {}): DiagnosticDetails | undefin
 
 export function diagnosticErrorDetails(error: unknown): DiagnosticDetails {
   const value = error && typeof error === "object" ? error as Record<string, unknown> : {};
-  const message = typeof value.message === "string" ? value.message : "";
+  const rawMessage = typeof value.message === "string" ? value.message : "";
+  // Extractors mix warnings and terminal errors in stderr. A warning about
+  // missing age-restricted formats must not hide the actual failure below it.
+  const message = rawMessage.split(/\r?\n/).filter((line) => /^\s*ERROR:/i.test(line)).at(-1) || rawMessage;
   const status = typeof value.status === "number" ? value.status : Number(message.match(/\b(401|403|404|429|5\d\d)\b/)?.[1]);
   const reason = typeof value.code === "string" && REASONS.has(value.code) ? value.code
     : /timeout|timed out|délai/i.test(message) ? "timeout"
     : status === 401 ? "unauthorized" : status === 403 ? "forbidden"
-    : status === 429 ? "rate_limit" : /network|fetch failed|connexion/i.test(message) ? "network" : "unknown";
+    : status === 429 ? "rate_limit"
+    : /\bconfirm (?:that )?you(?:['’]re| are) not a bot\b/i.test(message) ? "bot_check"
+    : /\bconfirm your age\b|\b(?:video|content) (?:is )?age[- ]restricted\b|\b(?:video|content) may be inappropriate for some users\b/i.test(message) ? "age_restricted"
+    : /\bcookies?\b[^\n]{0,100}\b(?:expired|invalid|no longer valid|rotated)\b/i.test(message) ? "cookies_invalid"
+    : /\b(?:login|authentication) required\b|\bsign in to (?:view|watch|access|confirm)\b|\bprivate video\b[^\n]*\bsign in\b/i.test(message) ? "login_required"
+    : /\b(?:the following|this|the) content is not available on this app\b|\b(?:video|content) is not available on this client\b|\b(?:player )?client\b[^\n]{0,40}\b(?:not supported|unsupported)\b/i.test(message) ? "client_unavailable"
+    : /\brequested formats? (?:is|are) not available\b|\bno (?:video|audio) formats? (?:found|available)\b/i.test(message) ? "format_unavailable"
+    : /network|fetch failed|connexion/i.test(message) ? "network" : "unknown";
   return safeDetails({ status, reason }) || { reason: "unknown" };
 }
 

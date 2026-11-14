@@ -60,6 +60,7 @@ function details(value: unknown): DiagnosticDetails | undefined {
   if (typeof data.trackId === "string" && /^\d{1,12}$/.test(data.trackId)) result.trackId = data.trackId;
   if (typeof data.reason === "string" && [
     "timeout", "network", "unauthorized", "forbidden", "rate_limit", "unavailable",
+    "age_restricted", "login_required", "bot_check", "cookies_invalid", "format_unavailable", "client_unavailable",
     "client_disconnect", "server_disconnect", "transport_close", "transport_error", "ping_timeout", "parse_error", "cancelled", "shutdown",
     "listener_limit", "deprecated", "uncaught_exception", "unhandled_rejection", "SIGINT", "SIGTERM", "idle", "startup_failed", "http_error",
     "ENOENT", "EACCES", "EPERM", "ECONNRESET", "ECONNREFUSED", "EPIPE", "ENOTFOUND", "EADDRINUSE", "unknown",

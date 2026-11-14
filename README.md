@@ -200,7 +200,9 @@ Cette séparation est importante: le mode local doit continuer à servir `fronte
 | `AUDIO_PROFILE` | Profil audio par défaut: `balanced` ou `xbox`. |
 | `WINDOWS_MPV_AUDIO_DEVICE` | Périphérique audio Windows utilisé par `mpv`. |
 | `VOICEMEETER_PATH` | Chemin vers VoiceMeeter sur Windows. |
-| `YTDLP_COOKIES_PATH` | Fichier cookies pour aider la résolution YouTube. |
+| `YTDLP_COOKIES_PATH` | Export Netscape d'une session YouTube; `backend/cookies.txt` par défaut. Le compte doit pouvoir lire les vidéos soumises à une restriction d'âge. |
+| `YTDLP_COOKIES_FROM_BROWSER` | Navigateur dont yt-dlp lit la session, par exemple `firefox`; utilisé en l'absence de fichier cookies. |
+| `YTDLP_JS_RUNTIME` | Moteur JavaScript utilisé par yt-dlp. Par défaut, Node et le chemin de l'exécutable du backend; surcharge possible avec `deno:/chemin/deno`. |
 | `YTDLP_BIN` | Exécutable yt-dlp personnalisé; sinon, le bot privilégie la copie installée dans le backend. |
 | `PLAYER_PROVIDER_MATCH_CACHE_PATH` | Fichier du cache des correspondances, `backend/.data/provider-match-cache.json` par défaut. |
 | `PLAYER_PROVIDER_MATCH_CACHE_MAX` | Nombre maximal de correspondances conservées, 1000 par défaut, plafonné à 10000. |
