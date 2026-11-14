@@ -5,15 +5,21 @@ import path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
 import { YTDLP_CONFIG } from "../src/config.js";
 import { diagnostics } from "../src/diagnostics.js";
+import { getMetrics } from "../src/metrics.js";
 
 const originalConfig = { ...YTDLP_CONFIG };
 let directory: string;
 let logPath: string;
 let importId = 0;
+let temporaryEnvironment: Record<string, string | undefined>;
+const cookieExport = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tLOGIN_INFO\tfixture-session\n";
 
 beforeEach(() => {
   directory = fs.mkdtempSync(path.join(os.tmpdir(), "xmbot-extractor-test-"));
+  temporaryEnvironment = Object.fromEntries(["TMPDIR", "TMP", "TEMP"].map((key) => [key, process.env[key]]));
+  for (const key of Object.keys(temporaryEnvironment)) process.env[key] = directory;
   logPath = path.join(directory, "calls.jsonl");
+  fs.writeFileSync(path.join(directory, "cookies.txt"), cookieExport, { mode: 0o600 });
   const runner = path.join(directory, "extractor.cjs");
   fs.writeFileSync(runner, `
     const fs = require('node:fs');
@@ -24,6 +30,23 @@ beforeEach(() => {
     const target = new URL(args.at(-1));
     const format = args[args.indexOf('-f') + 1];
     const withCookies = args.includes('--cookies') || args.includes('--cookies-from-browser');
+    if (target.searchParams.has('rewrite-cookies') && args.includes('--cookies')) {
+      const cookiePath = args[args.indexOf('--cookies') + 1];
+      const before = fs.readFileSync(cookiePath, 'utf8');
+      fs.appendFileSync(logPath + '.cookie-states', JSON.stringify({
+        path: cookiePath,
+        hasSession: before.includes('fixture-session'),
+        fileMode: fs.statSync(cookiePath).mode & 0o777,
+        directoryMode: fs.statSync(require('node:path').dirname(cookiePath)).mode & 0o777
+      }) + '\\n');
+      // Reproduce yt-dlp saving a logged-out response back to its cookie jar.
+      fs.writeFileSync(cookiePath, '# Netscape HTTP Cookie File\\n');
+      if (!before.includes('fixture-session')) process.exit(1);
+    }
+    if (target.searchParams.has('rotated-cookies') && withCookies) {
+      fs.writeSync(2, 'WARNING: [youtube] The provided YouTube account cookies are no longer valid. They have likely been rotated in the browser.\\nERROR: [youtube] Sign in to confirm your age.');
+      process.exit(1);
+    }
     if (target.searchParams.has('authenticated-combined') || target.searchParams.has('authenticated-audio')) {
       const failure = !withCookies ? 'Sign in to confirm your age.'
         : args.includes('--extractor-args') ? 'The following content is not available on this app.'
@@ -60,7 +83,11 @@ beforeEach(() => {
       fs.writeSync(2, 'HTTP Error 403: https://private.invalid/audio?token=private-secret');
       process.exit(1);
     }
-    if (target.searchParams.has('hang')) setInterval(() => {}, 1000);
+    if (target.searchParams.has('flood')) {
+      fs.writeSync(1, Buffer.alloc(33 * 1024 * 1024, 'x'));
+      setInterval(() => {}, 1000);
+    }
+    else if (target.searchParams.has('hang')) setInterval(() => {}, 1000);
     else setTimeout(() => {
     const output = {
       url: 'https://media.invalid/audio?run=' + run + '&expire=' + (target.searchParams.get('expire') || Math.floor(Date.now() / 1000 + (target.searchParams.has('stale-first') && run === 1 ? -10 : 600))),
@@ -90,6 +117,10 @@ beforeEach(() => {
 
 afterEach(() => {
   Object.assign(YTDLP_CONFIG, originalConfig);
+  for (const [key, value] of Object.entries(temporaryEnvironment)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   fs.rmSync(directory, { recursive: true, force: true });
 });
 
@@ -98,6 +129,21 @@ const calls = () => fs.existsSync(logPath)
   ? fs.readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[])
   : [];
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+const cookieStates = () => fs.existsSync(logPath + ".cookie-states")
+  ? fs.readFileSync(logPath + ".cookie-states", "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as { path: string; hasSession: boolean; fileMode: number; directoryMode: number })
+  : [];
+const useCookieFile = () => {
+  YTDLP_CONFIG.hasCookies = true;
+  YTDLP_CONFIG.cookiesPath = path.join(directory, "cookies.txt");
+};
+const assertCookieSnapshotsRemoved = () => {
+  assert.equal(fs.readFileSync(path.join(directory, "cookies.txt"), "utf8"), cookieExport);
+  assert.ok(!fs.readdirSync(directory).some((name) => name.startsWith("xmb-ytdlp-cookies-")), "temporary cookie directories must be removed before resolution settles");
+  for (const entry of cookieStates()) {
+    assert.notEqual(entry.path, YTDLP_CONFIG.cookiesPath);
+    assert.equal(fs.existsSync(path.dirname(entry.path)), false);
+  }
+};
 
 test("parallel source resolution shares one extraction and filters unsafe headers", async () => {
   const { getPlayableSource } = await freshResolver();
@@ -288,6 +334,94 @@ test("a hung extractor is killed and source resolution releases within its total
   assert.equal(await getPlayableSource("https://fixture.invalid/track?hang=1"), null);
   assert.ok(Date.now() - started < 2_000);
   assert.equal(calls().length, 1);
+});
+
+test("parallel authenticated extractions cannot replace the original cookie export or each other's sessions", async () => {
+  useCookieFile();
+  const originalStat = fs.statSync(YTDLP_CONFIG.cookiesPath!);
+  const { getPlayableSource } = await freshResolver();
+  const sources = await Promise.all(Array.from({ length: 6 }, (_, index) =>
+    getPlayableSource(`https://www.youtube.com/watch?v=offline1234&rewrite-cookies=1&track=${index}`)
+  ));
+  assert.ok(sources.every((source) => source?.debugLabel === "youtube-bestaudio-cookies"));
+  const snapshots = cookieStates();
+  assert.equal(snapshots.length, 6);
+  assert.equal(new Set(snapshots.map((entry) => entry.path)).size, 6);
+  assert.ok(snapshots.every((entry) => entry.hasSession));
+  if (process.platform !== "win32") {
+    assert.ok(snapshots.every((entry) => entry.fileMode === 0o600 && entry.directoryMode === 0o700));
+  }
+  assertCookieSnapshotsRemoved();
+  assert.equal(fs.statSync(YTDLP_CONFIG.cookiesPath!).mtimeMs, originalStat.mtimeMs);
+});
+
+test("failed metadata extraction removes its rewritten cookie snapshot and preserves the export", async () => {
+  useCookieFile();
+  const { probeSingle } = await freshResolver();
+  await probeSingle("https://www.youtube.com/@offline-fixture?rewrite-cookies=1&fail=1");
+  assert.equal(cookieStates().length, 1);
+  assertCookieSnapshotsRemoved();
+});
+
+test("timed-out extraction removes its private cookie snapshot and keeps the total deadline", async () => {
+  useCookieFile();
+  YTDLP_CONFIG.processTimeoutMs = 250;
+  const { getPlayableSource } = await freshResolver();
+  const started = Date.now();
+  assert.equal(await getPlayableSource("https://www.youtube.com/watch?v=offline1234&rewrite-cookies=1&hang=1"), null);
+  assert.ok(Date.now() - started < 2_000);
+  assert.equal(cookieStates().length, 1);
+  assertCookieSnapshotsRemoved();
+  await delay(50); // A late close must not recreate the snapshot.
+  assertCookieSnapshotsRemoved();
+});
+
+test("the output limit kills extraction and removes its private cookie snapshot", async () => {
+  useCookieFile();
+  const { probeSingle } = await freshResolver();
+  await probeSingle("https://www.youtube.com/@offline-fixture?rewrite-cookies=1&flood=1");
+  assert.equal(getMetrics().filter((metric) => metric.name === "yt-dlp").at(-1)?.data?.outputLimit, true);
+  assert.equal(cookieStates().length, 1);
+  assertCookieSnapshotsRemoved();
+  await delay(50);
+  assertCookieSnapshotsRemoved();
+});
+
+test("spawn failures remove a prepared cookie snapshot without exposing its path", async (t) => {
+  useCookieFile();
+  YTDLP_CONFIG.bin = path.join(directory, "missing-extractor");
+  const output: unknown[][] = [];
+  for (const method of ["log", "warn", "error"] as const) t.mock.method(console, method, (...args: unknown[]) => output.push(args));
+  const { probeSingle } = await freshResolver();
+  await probeSingle("https://www.youtube.com/@offline-fixture");
+  assertCookieSnapshotsRemoved();
+  const observed = JSON.stringify({ output, events: diagnostics.events() });
+  assert.ok(!observed.includes(directory));
+  assert.ok(!observed.includes("fixture-session"));
+});
+
+test("cookie snapshot setup failures are sanitized and remove incomplete private directories", async (t) => {
+  useCookieFile();
+  YTDLP_CONFIG.cookiesPath = path.join(directory, "missing-cookies.txt");
+  const output: unknown[][] = [];
+  for (const method of ["log", "warn", "error"] as const) t.mock.method(console, method, (...args: unknown[]) => output.push(args));
+  const { probeSingle } = await freshResolver();
+  await probeSingle("https://www.youtube.com/@offline-fixture");
+  assert.equal(calls().length, 0);
+  assertCookieSnapshotsRemoved();
+  const observed = JSON.stringify({ output, events: diagnostics.events() });
+  assert.ok(!observed.includes(directory));
+  assert.ok(!observed.includes("fixture-session"));
+});
+
+test("a rotated authenticated session is diagnosed without overwriting the user's export", async () => {
+  useCookieFile();
+  const { getPlayableSource } = await freshResolver();
+  assert.equal(await getPlayableSource("https://www.youtube.com/watch?v=offline1234&rewrite-cookies=1&rotated-cookies=1&access-denied=age_restricted"), null);
+  const failure = diagnostics.events().find((event) => event.code === "MEDIA_RESOLUTION_FAILED");
+  assert.equal(failure?.details?.reason, "cookies_invalid");
+  assert.ok(cookieStates().length > 0);
+  assertCookieSnapshotsRemoved();
 });
 
 test("malformed percent encoding on a direct media URL does not crash metadata resolution", async () => {

@@ -70,9 +70,13 @@ Une panne du tunnel Cloudflare ne ferme plus l'application locale : le lanceur l
 
 Vérifie d'abord que le compte connecté dans le navigateur peut lire la vidéo. Exporte ensuite ses cookies YouTube au format Netscape vers `backend/cookies.txt`, ou configure `YTDLP_COOKIES_PATH` dans `backend/.env` pour utiliser un autre fichier. Le fichier `www.youtube.com_cookies.txt` n'est pas choisi automatiquement. Relance le bot après modification.
 
+Chaque extraction utilise une copie temporaire privée du fichier cookies, supprimée à la fin de la tentative. yt-dlp peut réécrire sa copie sans modifier l'export configuré ni interférer avec une analyse ou un préchargement en parallèle. Cette protection ne réactive pas une session déjà invalidée par YouTube.
+
 Autre possibilité : configure `YTDLP_COOKIES_FROM_BROWSER=firefox` (ou ton navigateur compatible) dans `backend/.env`. Le fichier cookies a priorité : retire sa configuration et déplace `backend/cookies.txt` si tu veux utiliser la session du navigateur. Un export périmé ne devient pas valide en changeant de format audio ou de client.
 
-YouTube renouvelle régulièrement les cookies des onglets ouverts. Le [guide officiel yt-dlp](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies) décrit comment exporter une session qui reste utilisable. Ne joins jamais ce fichier au diagnostic.
+YouTube renouvelle régulièrement les cookies des onglets ouverts. Pour exporter une session durable, ouvre une fenêtre privée, connecte-toi à YouTube et vérifie que la vidéo se lit. Dans le même onglet, ouvre `https://www.youtube.com/robots.txt`, exporte les cookies YouTube, puis ferme toute cette fenêtre privée sans rouvrir sa session. Le [guide officiel yt-dlp](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies) détaille cette procédure. Ne joins jamais ce fichier au diagnostic.
+
+Si YouTube signale que les cookies ne sont plus valides avant de demander une confirmation d'âge, le diagnostic affiche `YOUTUBE_COOKIES_INVALID`. Les avertissements sont analysés en mémoire; leurs textes bruts et les identifiants restent exclus du journal.
 
 Le bot essaie d'abord l'audio seul, puis un flux combiné avec des clients compatibles avec les cookies pour les deux profils audio. Node est activé par défaut pour les vérifications JavaScript de yt-dlp; `YTDLP_JS_RUNTIME` permet de choisir un autre moteur. Ces replis ne remplacent pas l'autorisation du compte exigée par YouTube.
 

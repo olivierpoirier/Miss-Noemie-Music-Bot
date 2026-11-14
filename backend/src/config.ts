@@ -233,7 +233,6 @@ export const YTDLP_CONFIG = {
   baseArgs: [
     ...(envEnabled("YTDLP_FORCE_IPV4", false) ? ["--force-ipv4"] : []),
     "--no-progress",
-    "--no-warnings",
     "--ignore-config",
     "--js-runtimes",
     YTDLP_JS_RUNTIME,

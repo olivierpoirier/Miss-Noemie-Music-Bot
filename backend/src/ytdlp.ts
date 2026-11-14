@@ -1,4 +1,7 @@
 import { spawn } from "child_process";
+import { chmod, copyFile, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import play from "play-dl";
 import { performance } from "node:perf_hooks";
 import { recordBackendMetric } from "./metrics.js";
@@ -807,6 +810,39 @@ async function resolveYoutubePlaylistFast(
 /* YT-DLP RUNNER                                    */
 /* ------------------------------------------------ */
 
+async function withCookieSnapshot<T>(
+  args: string[],
+  operation: (args: string[], cleanup: () => Promise<void>) => Promise<T>
+): Promise<T> {
+  let directory: string | undefined;
+  const cleanup = async () => {
+    if (!directory) return;
+    // Windows may still hold the file while a killed extractor is exiting.
+    // Cleanup is also retried on close, after timeout/output-limit rejection.
+    await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 }).catch(() => {});
+  };
+  try {
+    const cookieIndex = args.lastIndexOf("--cookies");
+    if (cookieIndex >= 0 && args[cookieIndex + 1]) {
+      try {
+        directory = await mkdtemp(path.join(tmpdir(), "xmb-ytdlp-cookies-"));
+        const snapshot = path.join(directory, "cookies.txt");
+        await copyFile(args[cookieIndex + 1], snapshot);
+        await chmod(snapshot, 0o600);
+        // yt-dlp saves response cookies to this path on exit. Never let a
+        // metadata request or parallel extraction replace the user's export.
+        args[cookieIndex + 1] = snapshot.replace(/\\/g, "/");
+      } catch (error) {
+        const details = diagnosticErrorDetails(error);
+        throw Object.assign(new Error("Impossible de préparer les cookies YouTube."), { code: details.reason });
+      }
+    }
+    return await operation(args, cleanup);
+  } finally {
+    await cleanup();
+  }
+}
+
 async function runYtDlp(
   url: string,
   extraArgs: string[],
@@ -822,8 +858,15 @@ async function runYtDlp(
     });
   };
 
-  return new Promise((resolve, reject) => {
-    const proc = spawn(YTDLP_CONFIG.bin, finalArgs, {
+  return withCookieSnapshot(finalArgs, (args, cleanup) => new Promise((resolve, reject) => {
+    const remainingMs = (opts?.timeoutMs ?? YTDLP_CONFIG.processTimeoutMs) - (Date.now() - startedAt);
+    if (remainingMs <= 0) {
+      record(false, { timeout: true });
+      recordDiagnostic("YTDLP_TIMEOUT", { durationMs: Date.now() - startedAt, reason: "timeout", platform: getMediaPlatform(url) });
+      reject(new Error("yt-dlp timeout"));
+      return;
+    }
+    const proc = spawn(YTDLP_CONFIG.bin, args, {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
       detached: process.platform !== "win32",
@@ -842,7 +885,7 @@ async function runYtDlp(
       recordDiagnostic("YTDLP_TIMEOUT", { durationMs: Date.now() - startedAt, reason: "timeout", platform: getMediaPlatform(url) });
 
       reject(new Error("yt-dlp timeout"));
-    }, opts?.timeoutMs ?? YTDLP_CONFIG.processTimeoutMs);
+    }, remainingMs);
 
     proc.stdout.on("data", (d) => {
       if (finished) return;
@@ -871,7 +914,10 @@ async function runYtDlp(
     });
 
     proc.on("close", (code) => {
-      if (finished) return;
+      if (finished) {
+        void cleanup();
+        return;
+      }
       finished = true;
       clearTimeout(timeout);
 
@@ -887,7 +933,7 @@ async function runYtDlp(
         reject(Object.assign(new Error("L'extraction yt-dlp a échoué."), { status: details.status, code: details.reason }));
       }
     });
-  });
+  }));
 }
 
 /* ------------------------------------------------ */

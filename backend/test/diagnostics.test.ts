@@ -120,7 +120,15 @@ test("YouTube restrictions are classified from terminal errors without retaining
   const cases = [
     {
       reason: "age_restricted",
+      stderr: "ERROR: [youtube] KVLXhne2I2E: Sign in to confirm your age. Use --cookies-from-browser or --cookies for the authentication.",
+    },
+    {
+      reason: "cookies_invalid",
       stderr: "WARNING: [youtube] The provided YouTube account cookies are no longer valid. They have likely been rotated in the browser.\nERROR: [youtube] KVLXhne2I2E: Sign in to confirm your age. Use --cookies-from-browser or --cookies for the authentication.",
+    },
+    {
+      reason: "cookies_invalid",
+      stderr: "WARNING: [youtube] The provided YouTube account cookies are no longer valid.\nERROR: [youtube] Login required.",
     },
     {
       reason: "login_required",
@@ -150,6 +158,7 @@ test("YouTube restrictions are classified from terminal errors without retaining
   }
   assert.deepEqual(diagnosticErrorDetails(new Error("WARNING: [youtube] This video is age-restricted; some formats may be missing.\nERROR: unable to download audio data: HTTP Error 403: Forbidden")), { status: 403, reason: "forbidden" });
   assert.deepEqual(diagnosticErrorDetails(new Error("WARNING: [youtube] The provided cookies are no longer valid\nERROR: network unavailable")), { reason: "network" });
+  assert.deepEqual(diagnosticErrorDetails(new Error("WARNING: [youtube] The provided cookies are no longer valid\nERROR: Requested format is not available")), { reason: "format_unavailable" });
   assert.deepEqual(diagnosticErrorDetails(new Error("WARNING: [youtube] This video is age-restricted\nERROR: Download timed out")), { reason: "timeout" });
   assert.deepEqual(diagnosticErrorDetails(new Error("ERROR: [youtube] fixture1234: Unable to extract player response")), { reason: "unknown" });
 });

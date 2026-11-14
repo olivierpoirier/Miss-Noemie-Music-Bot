@@ -68,6 +68,8 @@ const REASONS = new Set([
   "ENOENT", "EACCES", "EPERM", "ECONNRESET", "ECONNREFUSED", "EPIPE", "ENOTFOUND", "EADDRINUSE", "unknown",
 ]);
 
+const INVALID_COOKIES_PATTERN = /\bcookies?\b[^\n]{0,100}\b(?:expired|invalid|no longer valid|rotated)\b/i;
+
 function safeDetails(input: DiagnosticDetails = {}): DiagnosticDetails | undefined {
   const result: DiagnosticDetails = {};
   for (const key of ["status", "exitCode", "durationMs", "attempt", "activeUsers", "itemCount", "uptimeSec", "rssMB", "heapUsedMB", "lagMs"] as const) {
@@ -97,12 +99,16 @@ export function diagnosticErrorDetails(error: unknown): DiagnosticDetails {
     : status === 429 ? "rate_limit"
     : /\bconfirm (?:that )?you(?:['’]re| are) not a bot\b/i.test(message) ? "bot_check"
     : /\bconfirm your age\b|\b(?:video|content) (?:is )?age[- ]restricted\b|\b(?:video|content) may be inappropriate for some users\b/i.test(message) ? "age_restricted"
-    : /\bcookies?\b[^\n]{0,100}\b(?:expired|invalid|no longer valid|rotated)\b/i.test(message) ? "cookies_invalid"
+    : INVALID_COOKIES_PATTERN.test(message) ? "cookies_invalid"
     : /\b(?:login|authentication) required\b|\bsign in to (?:view|watch|access|confirm)\b|\bprivate video\b[^\n]*\bsign in\b/i.test(message) ? "login_required"
     : /\b(?:the following|this|the) content is not available on this app\b|\b(?:video|content) is not available on this client\b|\b(?:player )?client\b[^\n]{0,40}\b(?:not supported|unsupported)\b/i.test(message) ? "client_unavailable"
     : /\brequested formats? (?:is|are) not available\b|\bno (?:video|audio) formats? (?:found|available)\b/i.test(message) ? "format_unavailable"
     : /network|fetch failed|connexion/i.test(message) ? "network" : "unknown";
-  return safeDetails({ status, reason }) || { reason: "unknown" };
+  // An explicit session rejection explains a following age/login refusal.
+  // Keep unrelated terminal failures (network, formats, HTTP) authoritative.
+  const classifiedReason = (reason === "age_restricted" || reason === "login_required") &&
+    INVALID_COOKIES_PATTERN.test(rawMessage) ? "cookies_invalid" : reason;
+  return safeDetails({ status, reason: classifiedReason }) || { reason: "unknown" };
 }
 
 type StoreOptions = { enabled: boolean; directory: string; maxBytes: number; maxFiles: number; maxEvents: number };
